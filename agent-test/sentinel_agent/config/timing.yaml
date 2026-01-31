@@ -1,0 +1,19 @@
+# sentinel_agent/config/timing.yaml
+
+collectors:
+  process_poll_interval: 1       # seconds
+  network_poll_interval: 2
+  filesystem_poll_interval: 3
+  memory_poll_interval: 3
+  access_poll_interval: 5
+  persistence_poll_interval: 5
+
+context:
+  context_timeout: 30             # seconds
+
+sender:
+  send_interval: 10               # seconds
+  max_batch_size: 10
+
+cleaner:
+  deduplication_window: 2         # seconds

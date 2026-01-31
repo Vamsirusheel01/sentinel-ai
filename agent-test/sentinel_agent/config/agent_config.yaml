@@ -1,0 +1,21 @@
+# sentinel_agent/config/agent_config.yaml
+
+agent:
+  name: "Sentinel-AI-Agent"
+  version: "0.1.0"
+  environment: "development"   # development | staging | production
+  reset_buffer_on_start: true
+
+device:
+  auto_generate_id: true
+
+backend:
+  api_url: "http://127.0.0.1:5000/api/logs"
+  timeout_seconds: 5
+  batch_size: 10
+  retry_on_failure: true
+
+logging:
+  level: "INFO"                # DEBUG | INFO | WARNING | ERROR
+  log_to_file: true
+  log_directory: "logs"

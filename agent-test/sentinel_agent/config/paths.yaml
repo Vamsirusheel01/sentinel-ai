@@ -1,0 +1,27 @@
+# sentinel_agent/config/paths.yaml
+
+filesystem:
+  watch_paths:
+    - "~/Downloads"
+    - "~/Desktop"
+    - "~/Documents"
+    - "/tmp"
+    - "C:\\Windows\\Temp"
+
+  protected_paths:
+    - "/etc"
+    - "/root"
+    - "C:\\Windows\\System32"
+    - "C:\\Program Files"
+
+persistence:
+  startup_paths:
+    linux: "~/.config/autostart"
+    windows: "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"
+
+raw_store:
+  base_dir: "raw_store"
+
+buffer:
+  queue_file: "buffer/clean_context_queue.jsonl"
+  retry_file: "buffer/retry_queue.jsonl"

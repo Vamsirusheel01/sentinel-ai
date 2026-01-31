@@ -1,0 +1,14 @@
+2026-01-31 19:47:29,228 | INFO | Initializing Sentinel AI Agent
+2026-01-31 19:48:27,487 | INFO | Initializing Sentinel AI Agent
+2026-01-31 19:51:13,699 | INFO | Initializing Sentinel AI Agent
+2026-01-31 19:51:13,766 | INFO | Starting collectors
+2026-01-31 19:51:13,961 | INFO | Sentinel AI Agent is running
+2026-01-31 19:52:13,938 | WARNING | Graceful shutdown initiated
+2026-01-31 19:52:53,947 | INFO | Initializing Sentinel AI Agent
+2026-01-31 19:52:54,019 | INFO | Starting collectors
+2026-01-31 19:52:54,142 | INFO | Sentinel AI Agent is running
+2026-01-31 19:54:30,237 | WARNING | Graceful shutdown initiated
+2026-01-31 19:54:37,381 | INFO | Initializing Sentinel AI Agent
+2026-01-31 19:54:37,475 | INFO | Starting collectors
+2026-01-31 19:54:37,562 | INFO | Sentinel AI Agent is running
+2026-01-31 19:57:56,160 | WARNING | Graceful shutdown initiated
