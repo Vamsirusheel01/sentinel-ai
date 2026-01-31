@@ -1,13 +1,14 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 import sqlite3
 import json
+import time
 from datetime import datetime
 
 app = Flask(__name__)
 DB = "database.db"
 
 
-# ------------------ DATABASE INIT ------------------
+# ================== DATABASE INIT ==================
 
 def init_db():
     conn = sqlite3.connect(DB)
@@ -27,22 +28,49 @@ def init_db():
     conn.close()
 
 
-# ------------------ HELPERS ------------------
+# ================== PAYLOAD CLASSIFIER ==================
+
+def classify_payload(payload):
+    if payload.get("payload_type"):
+        return payload.get("payload_type")
+
+    if payload.get("events"):
+        event_types = {e.get("event_type") for e in payload.get("events", [])}
+
+        if "persistence_created" in event_types:
+            return "persistence_activity"
+
+        if "network_connect" in event_types and "process_start" in event_types:
+            return "process_network_activity"
+
+        if any(e.startswith("file_") for e in event_types if e):
+            return "filesystem_activity"
+
+        if "process_start" in event_types:
+            return "process_execution"
+
+    return "unknown"
+
+
+# ================== STORE PAYLOAD ==================
 
 def store_payload(payload):
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
 
-    device_id = payload.get("device_id")
+    device = payload.get("device", {})
+    device_id = device.get("device_id") or payload.get("device_id")
 
-    # Identify payload type
-    if payload.get("event_type"):
-        payload_type = "event"
-    elif payload.get("cpu") or payload.get("system"):
-        payload_type = "system_snapshot"
-    else:
-        payload_type = "unknown"
+    payload_type = classify_payload(payload)
 
+    record = {
+        "device_id": device_id,
+        "payload_type": payload_type,
+        "payload": payload,
+        "received_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    }
+
+    # Store in DB
     cur.execute("""
     INSERT INTO agent_payloads
     (device_id, payload_type, raw_payload, received_at)
@@ -51,14 +79,14 @@ def store_payload(payload):
         device_id,
         payload_type,
         json.dumps(payload),
-        datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        record["received_at"]
     ))
 
     conn.commit()
     conn.close()
 
-
-# ------------------ API ROUTES ------------------
+   
+# ================== ROUTES ==================
 
 @app.route("/", methods=["GET"])
 def home():
@@ -68,6 +96,7 @@ def home():
     })
 
 
+# -------- RECEIVE DATA (POST) --------
 @app.route("/api/logs", methods=["POST"])
 def receive_logs():
     payload = request.get_json()
@@ -90,6 +119,7 @@ def receive_logs():
     return jsonify({"status": "payload stored"}), 201
 
 
+# -------- VIEW STORED DATA --------
 @app.route("/api/logs", methods=["GET"])
 def view_logs():
     conn = sqlite3.connect(DB)
@@ -117,7 +147,21 @@ def view_logs():
     return jsonify(results)
 
 
-# ------------------ MAIN ------------------
+# -------- LIVE STREAM (NO REFRESH) --------
+@app.route("/api/logs/stream")
+def stream_logs():
+    def event_generator():
+        while True:
+            data = event_stream.get()
+            yield f"data: {json.dumps(data)}\n\n"
+
+    return Response(
+        event_generator(),
+        mimetype="text/event-stream"
+    )
+
+
+# ================== MAIN ==================
 
 if __name__ == "__main__":
     init_db()
