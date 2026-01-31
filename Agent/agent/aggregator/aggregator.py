@@ -1,9 +1,5 @@
 import time
 
-# === API GATEWAY (CENTRALIZED HERE) ===
-API_URL = "http://probable-dollop-g4xw7j4gv66ghv9pw-5000.app.github.dev/api/logs"
-
-
 def build_payload(
     identity,
     system_snapshot,
