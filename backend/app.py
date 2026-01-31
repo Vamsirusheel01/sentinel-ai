@@ -147,20 +147,6 @@ def view_logs():
     return jsonify(results)
 
 
-# -------- LIVE STREAM (NO REFRESH) --------
-@app.route("/api/logs/stream")
-def stream_logs():
-    def event_generator():
-        while True:
-            data = event_stream.get()
-            yield f"data: {json.dumps(data)}\n\n"
-
-    return Response(
-        event_generator(),
-        mimetype="text/event-stream"
-    )
-
-
 # ================== MAIN ==================
 
 if __name__ == "__main__":
