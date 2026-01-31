@@ -3,6 +3,7 @@ import sqlite3
 import json
 import time
 from datetime import datetime
+from parser import insert_payload
 
 app = Flask(__name__)
 DB = "database.db"
@@ -100,6 +101,8 @@ def home():
 @app.route("/api/logs", methods=["POST"])
 def receive_logs():
     payload = request.get_json()
+
+    insert_payload(request.json)
 
     if not payload:
         return jsonify({"error": "Empty payload"}), 400
