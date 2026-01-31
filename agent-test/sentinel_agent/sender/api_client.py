@@ -1,9 +1,15 @@
 # sentinel_agent/sender/api_client.py
 
+import os
 import requests
 
-API_URL = "http://probable-dollop-g4xw7j4gv66ghv9pw-5000.app.github.dev/api/logs"
-TIMEOUT = 2
+from utils.config_loader import load_config
+
+_CONFIG = load_config("config/agent_config.yaml")
+_BACKEND_CONFIG = _CONFIG.get("backend", {})
+
+API_URL = os.getenv("SENTINEL_BACKEND_URL", _BACKEND_CONFIG.get("api_url", "http://127.0.0.1:5000/api/logs"))
+TIMEOUT = int(os.getenv("SENTINEL_BACKEND_TIMEOUT", _BACKEND_CONFIG.get("timeout_seconds", 5)))
 
 
 def send_payload(payload):
@@ -14,11 +20,14 @@ def send_payload(payload):
         "Content-Type": "application/json"
     }
 
-    response = requests.post(
-        API_URL,
-        json=payload,
-        headers=headers,
-        timeout=TIMEOUT
-    )
+    try:
+        response = requests.post(
+            API_URL,
+            json=payload,
+            headers=headers,
+            timeout=TIMEOUT
+        )
+    except requests.RequestException:
+        return False
 
     return response.status_code == 201
