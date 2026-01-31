@@ -3,7 +3,7 @@
 import requests
 
 API_URL = "http://probable-dollop-g4xw7j4gv66ghv9pw-5000.app.github.dev/api/logs"
-TIMEOUT = 5
+TIMEOUT = 2
 
 
 def send_payload(payload):
