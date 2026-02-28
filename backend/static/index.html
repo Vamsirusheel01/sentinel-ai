@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sentinel AI | Security Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #0a0b10;
+            --surface: #14161f;
+            --primary: #00f2ff;
+            --danger: #ff4d4d;
+            --warning: #ffcc00;
+            --success: #00ff88;
+            --text: #e0e6ed;
+            --text-dim: #94a3b8;
+            --glass: rgba(255, 255, 255, 0.03);
+            --border: rgba(255, 255, 255, 0.08);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Outfit', sans-serif;
+        }
+
+        body {
+            background-color: var(--bg);
+            color: var(--text);
+            overflow-x: hidden;
+            min-height: 100vh;
+        }
+
+        .dashboard {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2.5rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .logo {
+            font-size: 1.5rem;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .logo span {
+            color: var(--primary);
+        }
+
+        .status-badge {
+            background: rgba(0, 255, 136, 0.1);
+            color: var(--success);
+            padding: 0.5rem 1rem;
+            border-radius: 2rem;
+            font-size: 0.85rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            background: var(--success);
+            border-radius: 50%;
+            box-shadow: 0 0 10px var(--success);
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.4; }
+            100% { opacity: 1; }
+        }
+
+        .main-grid {
+            display: grid;
+            grid-template-columns: 1fr 2fr;
+            gap: 2rem;
+        }
+
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 1.25rem;
+            padding: 1.5rem;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 2px;
+            background: linear-gradient(90deg, transparent, var(--primary), transparent);
+            opacity: 0.5;
+        }
+
+        .card-title {
+            font-size: 0.9rem;
+            font-weight: 600;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 1.5rem;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        /* Trust Score Display */
+        .trust-score-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 2rem 0;
+        }
+
+        .score-circle {
+            width: 220px;
+            height: 220px;
+            border-radius: 50%;
+            border: 12px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        .score-value {
+            font-size: 4.5rem;
+            font-weight: 700;
+            line-height: 1;
+        }
+
+        .score-label {
+            font-size: 0.85rem;
+            color: var(--text-dim);
+            margin-top: 0.5rem;
+        }
+
+        .device-info {
+            margin-top: 2rem;
+            width: 100%;
+        }
+
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 0.85rem 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .info-row:last-child { border-bottom: none; }
+
+        .info-label { color: var(--text-dim); font-size: 0.9rem; }
+        .info-value { font-weight: 600; font-size: 0.9rem; }
+
+        /* Event Log */
+        .event-log {
+            max-height: 600px;
+            overflow-y: auto;
+            padding-right: 0.5rem;
+        }
+
+        .event-log::-webkit-scrollbar { width: 4px; }
+        .event-log::-webkit-scrollbar-thumb { background: var(--border); border-radius: 10px; }
+
+        .event-item {
+            background: var(--glass);
+            margin-bottom: 0.75rem;
+            padding: 1rem;
+            border-radius: 0.75rem;
+            border-left: 3px solid var(--primary);
+            animation: slideIn 0.3s ease-out;
+            display: grid;
+            grid-template-columns: auto 1fr auto;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateX(10px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+
+        .event-icon {
+            width: 36px;
+            height: 36px;
+            border-radius: 8px;
+            background: rgba(0, 242, 255, 0.1);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--primary);
+        }
+
+        .event-details h4 { font-size: 0.95rem; margin-bottom: 0.25rem; }
+        .event-details p { font-size: 0.8rem; color: var(--text-dim); font-family: 'JetBrains Mono', monospace; }
+        .event-time { font-size: 0.75rem; color: var(--text-dim); }
+
+        .type-process { border-left-color: var(--primary); }
+        .type-network { border-left-color: #a855f7; }
+        .type-file { border-left-color: #f59e0b; }
+
+        .loading-bar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 3px;
+            background: var(--primary);
+            width: 0%;
+            transition: width 0.3s;
+            z-index: 1000;
+        }
+    </style>
+</head>
+<body>
+    <div class="loading-bar" id="loader"></div>
+    <div class="dashboard">
+        <header>
+            <div class="logo">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                SENTINEL <span>AI</span>
+            </div>
+            <div class="status-badge">
+                <div class="status-dot"></div>
+                SYSTEM ACTIVE
+            </div>
+        </header>
+
+        <div class="main-grid">
+            <!-- Left Column: Trust Score & Device -->
+            <div class="left-col">
+                <div class="card">
+                    <div class="card-title">
+                        Dynamic Trust Score
+                        <span id="update-timer">10s</span>
+                    </div>
+                    <div class="trust-score-container">
+                        <div class="score-circle" id="score-ring">
+                            <span class="score-value" id="trust-val">--</span>
+                            <span class="score-label">SECURE</span>
+                        </div>
+                        
+                        <div class="device-info" id="device-data">
+                            <div class="info-row">
+                                <span class="info-label">Hostname</span>
+                                <span class="info-value" id="host-name">Searching...</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label">OS</span>
+                                <span class="info-value" id="os-name">--</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label">Agent Status</span>
+                                <span class="info-value" style="color:var(--success)">Connected</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label">Last Heartbeat</span>
+                                <span class="info-value" id="last-seen">--</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Column: Live Telemetry -->
+            <div class="right-col">
+                <div class="card">
+                    <div class="card-title">Live Telemetry Stream</div>
+                    <div class="event-log" id="event-feed">
+                        <!-- Events will appear here -->
+                        <div style="text-align:center; padding: 2rem; color: var(--text-dim);">Waiting for telemetry from agent...</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let lastEventId = null;
+
+        function formatEventTime(value) {
+            if (typeof value === 'number') {
+                const ms = value < 1e12 ? value * 1000 : value;
+                return new Date(ms).toLocaleTimeString();
+            }
+
+            if (typeof value === 'string') {
+                const asNum = Number(value);
+                if (!Number.isNaN(asNum)) {
+                    const ms = asNum < 1e12 ? asNum * 1000 : asNum;
+                    return new Date(ms).toLocaleTimeString();
+                }
+                return new Date(value).toLocaleTimeString();
+            }
+
+            return '--';
+        }
+
+        async function updateDashboard() {
+            const loader = document.getElementById('loader');
+            loader.style.width = '30%';
+            
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+                
+                loader.style.width = '70%';
+
+                if (data.devices && data.devices.length > 0) {
+                    const dev = data.devices[0];
+                    document.getElementById('trust-val').innerText = Math.round(dev.trust_score);
+                    document.getElementById('host-name').innerText = dev.hostname;
+                    document.getElementById('os-name').innerText = dev.os;
+                    document.getElementById('last-seen').innerText = new Date(dev.last_seen).toLocaleTimeString();
+                    
+                    // Update Circle Color
+                    const ring = document.getElementById('score-ring');
+                    if (dev.trust_score > 80) ring.style.borderColor = 'var(--success)';
+                    else if (dev.trust_score > 50) ring.style.borderColor = 'var(--warning)';
+                    else ring.style.borderColor = 'var(--danger)';
+                }
+
+                if (data.recent_events) {
+                    const feed = document.getElementById('event-feed');
+                    feed.innerHTML = '';
+                    
+                    data.recent_events.forEach(event => {
+                        const item = document.createElement('div');
+                        item.className = 'event-item';
+                        if (event.event_type.includes('process')) item.classList.add('type-process');
+                        if (event.event_type.includes('network')) item.classList.add('type-network');
+                        if (event.event_type.includes('file')) item.classList.add('type-file');
+
+                        const time = formatEventTime(event.timestamp);
+                        
+                        let details = "";
+                        const raw = event.raw_data || {};
+                        const detailsObj = raw.details || raw;
+                        if (event.event_type === 'process_start') {
+                            details = detailsObj.process_name || detailsObj.cmdline || raw.process_name || raw.cmdline || 'process_start';
+                        } else {
+                            details = detailsObj.event_type || event.event_type;
+                        }
+
+                        item.innerHTML = `
+                            <div class="event-icon">
+                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
+                            </div>
+                            <div class="event-details">
+                                <h4>${event.event_type.replace('_', ' ').toUpperCase()}</h4>
+                                <p>${details}</p>
+                            </div>
+                            <div class="event-time">${time}</div>
+                        `;
+                        feed.appendChild(item);
+                    });
+                }
+            } catch (err) {
+                console.error("Dashboard update failed:", err);
+            } finally {
+                loader.style.width = '100%';
+                setTimeout(() => loader.style.width = '0%', 400);
+            }
+        }
+
+        // Timer countdown
+        let timeLeft = 10;
+        setInterval(() => {
+            timeLeft--;
+            if (timeLeft < 0) {
+                timeLeft = 10;
+                updateDashboard();
+            }
+            document.getElementById('update-timer').innerText = timeLeft + 's';
+        }, 1000);
+
+        // Initial Load
+        updateDashboard();
+    </script>
+</body>
+</html>

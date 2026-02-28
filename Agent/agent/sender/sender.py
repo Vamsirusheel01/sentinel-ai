@@ -9,19 +9,12 @@ TIMEOUT = 5
 def send(payload):
     """
     Sends ONE aggregated JSON payload to the local server
-    and also displays it on localhost console for debugging.
+    and returns feedback (like trust score).
     """
     if not payload:
         return None
 
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    # ---- Local Console Display ----
-    print("\n" + "=" * 70)
-    print(f"[Sentinel AI] Payload Generated @ {timestamp}")
-    print("=" * 70)
-    print(json.dumps(payload, indent=4))
-    print("=" * 70)
 
     # ---- Send to Local Server ----
     headers = {
@@ -35,8 +28,14 @@ def send(payload):
             headers=headers,
             timeout=TIMEOUT
         )
-        print(f"[Sender] Sent to local server | Status: {response.status_code}")
-        return response.status_code
+        
+        if response.status_code in [200, 201]:
+            data = response.json()
+            print(f"[Sender] Success | Trust Score: {data.get('trust_score')} | Feedback: {data.get('feedback')}")
+            return data
+        else:
+            print(f"[Sender] Server returned status: {response.status_code}")
+            return None
 
     except Exception as e:
         print("[Sender] Error sending data:", e)
