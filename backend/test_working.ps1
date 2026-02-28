@@ -51,6 +51,15 @@ function Send-Event($device, $processName, $cmdline) {
 
 Write-Host '--- Sentinel AI Working Test ---' -ForegroundColor Cyan
 
+# Check if a device ID was passed as an argument
+if ($args.Count -gt 0) {
+    $targetDeviceId = $args[0]
+    Write-Host "Testing against agent device: $targetDeviceId" -ForegroundColor Yellow
+} else {
+    $targetDeviceId = $null
+    Write-Host "Running synthetic device tests. To test agent device, run: .\test_working.ps1 <agent-device-id>" -ForegroundColor Yellow
+}
+
 # 1) Backend health/status
 try {
     $status = Invoke-RestMethod -Uri "$baseUrl/api/status" -Method Get
@@ -91,6 +100,49 @@ try {
 }
 catch {
     Write-Fail "Critical test failed: $($_.Exception.Message)"
+}
+
+# 4) Agent device threat injection (if device ID provided)
+if ($targetDeviceId) {
+    Write-Host "`nTesting threat injection on agent device..." -ForegroundColor Cyan
+    try {
+        $agentDevice = @{
+            device_id = $targetDeviceId
+            hostname = 'local'
+            os = 'Windows'
+            os_version = '11'
+            architecture = 'x64'
+        }
+        
+        # Inject recon event
+        $recon = Send-Event -device $agentDevice -processName 'cmd.exe' -cmdline 'whoami'
+        $reconScore = [double]$recon.trust_score
+        Write-Host "Recon (whoami): score=$reconScore feedback=$($recon.feedback)" -ForegroundColor Yellow
+        
+        # Wait a moment for recon window
+        Start-Sleep -Seconds 1
+        
+        # Inject attack event (should escalate)
+        $attack = Send-Event -device $agentDevice -processName 'cmd.exe' -cmdline 'schtasks create task'
+        $attackScore = [double]$attack.trust_score
+        $isEscalated = $attackScore -lt 80.0
+        Assert-True $isEscalated "Attack after recon escalated ($attackScore)" "Attack did not escalate enough ($attackScore)"
+        Write-Host "Attack (schtasks): score=$attackScore feedback=$($attack.feedback)" -ForegroundColor Red
+        
+        # Show recovery
+        Write-Host "Monitoring recovery..." -ForegroundColor Yellow
+        for ($i = 1; $i -le 3; $i++) {
+            Start-Sleep -Seconds 1
+            $recovery = Invoke-RestMethod -Uri "$baseUrl/api/logs" -Method Post -ContentType 'application/json' -Body (@{
+                device = $agentDevice
+                events = @()
+            } | ConvertTo-Json -Depth 6)
+            Write-Host "Recovery cycle $i : score=$($recovery.trust_score) feedback=$($recovery.feedback)" -ForegroundColor Green
+        }
+    }
+    catch {
+        Write-Fail "Agent device threat injection failed: $($_.Exception.Message)"
+    }
 }
 
 Write-Host "`nSummary: Passed=$passed Failed=$failed" -ForegroundColor Yellow
