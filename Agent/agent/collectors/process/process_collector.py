@@ -15,6 +15,6 @@ def collect_process_events():
                 "user": proc.info['username'],
                 "timestamp": time.time()
             })
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+        except (psutil.NoSuchProcess, psutil.AccessDenied, PermissionError):
             continue
     return events
