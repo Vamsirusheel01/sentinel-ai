@@ -1,0 +1,172 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+html.dark {
+  background-color: #0f172a;
+  color: #f1f5f9;
+}
+
+/* Enterprise Dashboard Animations */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slideInLeft {
+  from {
+    opacity: 0;
+    transform: translateX(-20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes slideInRight {
+  from {
+    opacity: 0;
+    transform: translateX(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes pulse-soft {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.8;
+  }
+}
+
+@keyframes slideDown {
+  from {
+    opacity: 0;
+    transform: translateY(-20px) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes shrink {
+  from {
+    width: 100%;
+  }
+  to {
+    width: 0%;
+  }
+}
+
+.animate-fadeIn {
+  animation: fadeIn 300ms ease-out;
+}
+
+.animate-slideInLeft {
+  animation: slideInLeft 300ms ease-out;
+}
+
+.animate-slideInRight {
+  animation: slideInRight 300ms ease-out;
+}
+
+.animate-pulse-soft {
+  animation: pulse-soft 2s ease-in-out infinite;
+}
+
+.animate-slideDown {
+  animation: slideDown 300ms ease-out;
+}
+
+.animate-shrink {
+  animation: shrink linear forwards;
+}
+
+/* Scrollbar Styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #64748b;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* Utilities */
+@layer components {
+  .card {
+    @apply bg-slate-800 border border-slate-700 rounded-lg shadow-lg;
+  }
+
+  .card-hover {
+    @apply card transition-all duration-200 hover:border-slate-600 hover:shadow-xl hover:shadow-slate-900/50;
+  }
+
+  .badge-success {
+    @apply bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 px-2 py-1 rounded text-xs font-medium;
+  }
+
+  .badge-warning {
+    @apply bg-yellow-500/20 text-yellow-300 border border-yellow-500/30 px-2 py-1 rounded text-xs font-medium;
+  }
+
+  .badge-danger {
+    @apply bg-red-500/20 text-red-300 border border-red-500/30 px-2 py-1 rounded text-xs font-medium;
+  }
+
+  .badge-info {
+    @apply bg-blue-500/20 text-blue-300 border border-blue-500/30 px-2 py-1 rounded text-xs font-medium;
+  }
+
+  .btn-primary {
+    @apply bg-gradient-to-r from-cyan-500 to-cyan-600 text-white px-4 py-2 rounded-lg font-medium transition-all duration-200 hover:shadow-lg hover:shadow-cyan-500/30;
+  }
+
+  .btn-secondary {
+    @apply bg-slate-700 text-slate-100 px-4 py-2 rounded-lg font-medium transition-all duration-200 hover:bg-slate-600;
+  }
+
+  .btn-ghost {
+    @apply text-slate-300 px-4 py-2 rounded-lg font-medium transition-all duration-200 hover:bg-slate-700/50 hover:text-slate-100;
+  }
+}
+

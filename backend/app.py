@@ -1,19 +1,67 @@
+@app.route("/api/system-status")
+def system_status():
+    global protection_active, agent_connected
+    return jsonify({
+        "protection_active": protection_active,
+        "agent_connected": agent_connected,
+        "backend_running": True
+    })
+@app.route("/api/start-protection", methods=["POST"])
+def start_protection():
+    global protection_active
+    protection_active = True
+    print("[SYSTEM] Protection started")
+    return jsonify({
+        "status": "success",
+        "protection_active": True,
+        "message": "Protection started"
+    }), 200
+
+@app.route("/api/stop-protection", methods=["POST"])
+def stop_protection():
+    global protection_active
+    protection_active = False
+    print("[SYSTEM] Protection stopped")
+    return jsonify({
+        "status": "success",
+        "protection_active": False,
+        "message": "Protection stopped"
+    }), 200
+@app.route("/api/start-protection", methods=["POST"])
+def start_protection():
+    """Enable protection — analysis will process events."""
+    global protection_active, system_status
+    protection_active = True
+    system_status = "Protected"
+    print("[System] Protection started")
+    return jsonify({"status": "success", "protection_active": True}), 200
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from collections import deque
 import sqlite3
 import json
 import os
 import uuid
 import re
+import threading
+import time
+import subprocess
 from datetime import datetime, timezone
 from typing import Dict, List, Any
 
 # Import YARA for rule-based detection
 try:
     import yara
-    RULES = yara.compile(filepath='sentinel_rules.yar')
-    DETECTION_ENGINE = 'YARA'
-    print("[Detection] YARA rules loaded successfully")
+    base_dir = os.path.dirname(__file__)
+    rules_path = os.path.join(base_dir, "detection", "rules", "malware_rules.yar")
+    if os.path.exists(rules_path):
+        RULES = yara.compile(filepath=rules_path)
+        DETECTION_ENGINE = 'YARA'
+        print(f"[Detection] YARA rules loaded successfully from {rules_path}")
+    else:
+        print("[Detection] YARA rules not found, continuing without signature detection.")
+        RULES = None
+        DETECTION_ENGINE = 'DISABLED'
 except Exception as e:
     print(f"[Detection] YARA rules failed to load: {e}")
     RULES = None
@@ -26,9 +74,150 @@ CORS(app) # Enable CORS for frontend
 def index():
     return app.send_static_file('index.html')
 
-DB = "database.db"
+DB = "sentinel.db"
 
-ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "45"))
+# ================== GLOBAL SYSTEM STATE ==================
+trust_score = 100.0
+system_status = "Protected"
+last_risk_event = None
+is_isolated = False  # Flag to prevent repeated isolation attempts
+protection_active = False  # Whether protection monitoring is active
+
+# Tracks when each event type penalty was last applied (to prevent burst penalties)
+recent_events = {}
+EVENT_TYPE_COOLDOWN_SECONDS = 5
+
+# Cooldown: tracks when each threat type last triggered a score reduction
+# If the same threat type occurs within 30 seconds, score reduction is skipped
+last_trigger_time: Dict[str, float] = {}
+ALERT_COOLDOWN_SECONDS_PATTERN = 30
+
+# Cooldown for YARA-based detection deduplication
+ALERT_COOLDOWN_SECONDS = 30
+
+def safe_float_ts(val, fallback=None):
+    """Convert any timestamp value to float (supports float and ISO format). Falls back to time.time() if invalid."""
+    if val is None:
+        return fallback if fallback is not None else time.time()
+    try:
+        return float(val)
+    except:
+        try:
+            return datetime.fromisoformat(val).timestamp()
+        except:
+            return fallback if fallback is not None else time.time()
+
+# Global sliding window event buffer for analyzing events
+event_window = deque(maxlen=300)
+
+# Trust score history — tracks only when score actually changes (capped at 500 entries)
+trust_score_history = deque(maxlen=500)
+previous_trust_score = 100.0  # Tracks last recorded score to avoid duplicate entries
+
+def record_trust_score_change(score: float):
+    """Append a timestamped trust score record to history only if score changed."""
+    global previous_trust_score
+    rounded = round(score, 1)
+    if rounded != previous_trust_score:
+        trust_score_history.append({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "score": rounded
+        })
+        previous_trust_score = rounded
+
+# Security alerts — stores last 100 alert objects for the /api/alerts endpoint
+security_alerts = deque(maxlen=100)
+
+# Connected devices — keyed by device_id
+devices = {}
+
+def record_security_alert(event_type: str, process_name: str, severity: str, trust_score_val: float, trust_score_before: float = None):
+    """Append a structured alert object to the security_alerts buffer."""
+    old_score = round(trust_score_before, 1) if trust_score_before is not None else round(trust_score_val, 1)
+    new_score = round(trust_score_val, 1)
+    impact = round(old_score - new_score, 1)
+    security_alerts.append({
+        "event_type": event_type,
+        "process_name": process_name,
+        "severity": severity,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "trust_score": new_score,
+        "old_score": old_score,
+        "new_score": new_score,
+        "impact": impact,
+        "description": f"Trust Score Impact: {old_score} → {new_score} (-{impact})"
+    })
+
+# ================== PROCESS INTELLIGENCE LISTS ==================
+# SAFE_PROCESSES → ignore completely (never enters event_window or analysis)
+SAFE_PROCESSES = {
+    "explorer.exe",
+    "chrome.exe",
+    "msedge.exe",
+    "svchost.exe",
+    "system",
+    "code.exe",
+    "python.exe",
+    "node.exe",
+    "npm.exe",
+    "electron.exe",
+    "vite.exe",
+    "git.exe",
+    "widgets.exe",
+    "startmenuexperiencehost.exe",
+}
+
+# SUSPICIOUS_PROCESSES → monitor behavior (allowed into event_window for pattern analysis)
+SUSPICIOUS_PROCESSES = {
+    "powershell.exe",
+    "wmic.exe",
+    "reg.exe",
+    "schtasks.exe",
+    "netsh.exe",
+    "rundll32.exe",
+    "mshta.exe",
+}
+
+# KNOWN_MALWARE → immediate critical alert and score reduction
+KNOWN_MALWARE = {
+    "mimikatz.exe",
+    "nc.exe",
+    "netcat.exe",
+    "meterpreter.exe",
+    "powersploit.ps1",
+}
+
+def update_system_status():
+    """Update system_status based on current trust_score"""
+    global system_status
+    if trust_score < 20:
+        system_status = "Isolated"
+    elif trust_score > 80:
+        system_status = "Protected"
+    elif trust_score >= 60:
+        system_status = "Warning"
+    elif trust_score >= 40:
+        system_status = "Suspicious"
+    else:
+        system_status = "Critical"
+
+# Event type penalties for trust score
+EVENT_TYPE_PENALTIES = {
+    "process_start": 0.2,
+    "file_modified": 0.5,
+    "network_connect": 1,
+    "persistence_created": 5,
+    "unauthorized_access_attempt": 8,
+}
+
+# Only these event types can reduce trust_score
+SCORE_REDUCING_EVENT_TYPES = {
+    "process_start",
+    "file_modified",
+    "network_connect",
+    "persistence_created",
+    "unauthorized_access_attempt",
+}
 RECOVERY_PER_CYCLE = float(os.getenv("RECOVERY_PER_CYCLE", "1.2"))
 SLOW_RECOVERY_PER_CYCLE = float(os.getenv("SLOW_RECOVERY_PER_CYCLE", "0.2"))
 FAST_RECOVERY_PER_CYCLE = float(os.getenv("FAST_RECOVERY_PER_CYCLE", "3.0"))
@@ -97,6 +286,26 @@ def init_db():
             timestamp TEXT
         )
         """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT,
+            process_name TEXT,
+            event_type TEXT,
+            severity TEXT,
+            timestamp TEXT
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS threat_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT,
+            severity TEXT,
+            trust_score_before REAL,
+            trust_score_after REAL,
+            timestamp TEXT
+        )
+        """)
         conn.commit()
     finally:
         conn.close()
@@ -104,12 +313,97 @@ def init_db():
 # ================== HELPERS ==================
 
 def get_db_connection():
-    conn = sqlite3.connect(DB, timeout=15)
+    conn = sqlite3.connect("sentinel_ai.db")
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 15000")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
     return conn
+
+def initialize_database():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id TEXT,
+        event_type TEXT,
+        process_name TEXT,
+        cmdline TEXT,
+        timestamp TEXT
+    )
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS alerts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        process_name TEXT,
+        severity TEXT,
+        event_type TEXT,
+        timestamp TEXT
+    )
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS trust_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        trust_score INTEGER,
+        timestamp TEXT
+    )
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS threat_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_type TEXT,
+        severity TEXT,
+        timestamp TEXT
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+initialize_database()
+
+def insert_log(device_id: str, process_name: str, event_type: str, severity: str, timestamp: str):
+    """Insert a log entry into the logs table"""
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO logs (device_id, process_name, event_type, severity, timestamp) VALUES (?, ?, ?, ?, ?)",
+            (device_id, process_name, event_type, severity, timestamp)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def insert_threat(event_type: str, severity: str, trust_score_before: float, trust_score_after: float, timestamp: str):
+    """Insert a threat entry into the threat_history table"""
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO threat_history (event_type, severity, trust_score_before, trust_score_after, timestamp) VALUES (?, ?, ?, ?, ?)",
+            (event_type, severity, trust_score_before, trust_score_after, timestamp)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_all_logs(limit: int = 100) -> List[Dict]:
+    """Get logs from the logs table ordered by timestamp DESC"""
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM logs ORDER BY timestamp DESC LIMIT ?", (limit,))
+        return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+def get_all_threats() -> List[Dict]:
+    """Get threat entries from the threat_history table ordered by timestamp DESC"""
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM threat_history ORDER BY timestamp DESC")
+        return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
 
 def record_events_batch(cur: sqlite3.Cursor, device_id: str, events: List[Dict], now: str):
     """Optimized batch recording of events"""
@@ -119,7 +413,7 @@ def record_events_batch(cur: sqlite3.Cursor, device_id: str, events: List[Dict],
     for event in events:
         event_id = str(uuid.uuid4())
         event_type = event.get("event_type", "unknown")
-        timestamp = event.get("timestamp") or now
+        timestamp = safe_float_ts(event.get("timestamp"), fallback=time.time())
         
         # Main event
         cur.execute("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?)", 
@@ -290,100 +584,343 @@ def calculate_trust_impact(device_id: str, events: List[Dict], now_ts: float):
     
     return observed_severity, score_impact, saw_recon, saw_attack
 
-# ================== ROUTES ==================
 
-@app.route("/api/logs", methods=["POST"])
-def receive_logs():
-    payload = request.get_json()
-    if not payload: return jsonify({"error": "No payload"}), 400
+def _handle_malware_detection(device_id: str, proc_name: str, event: dict, now_ts: float):
+    """Immediate critical alert when known malware is detected.
+    Reduces trust_score by 30 with 30-second cooldown per malware name."""
+    global trust_score, last_risk_event
 
-    device_info = payload.get("device", {})
+    pattern_key = f"malware_{proc_name}"
+    if not is_pattern_cooled_down(pattern_key, now_ts):
+        return
+
+    mark_pattern_detected(pattern_key, now_ts)
+    trust_score_before = trust_score
+    trust_score = max(0.0, trust_score - 30)
+    record_trust_score_change(trust_score)
+    record_security_alert("known_malware", proc_name, "critical", trust_score, trust_score_before)
+    current_time = datetime.now(timezone.utc).isoformat()
+
+    last_risk_event = {
+        "event_type": "known_malware",
+        "description": f"Known malware detected: {proc_name}",
+        "timestamp": current_time,
+        "severity": "critical",
+        "pattern": pattern_key,
+        "process_name": proc_name,
+    }
+
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO threat_history (event_type, severity, trust_score_before, trust_score_after, timestamp) VALUES (?, ?, ?, ?, ?)",
+            ("known_malware", "critical", trust_score_before, trust_score, current_time)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    update_system_status()
+    print(f"[MALWARE] Known malware detected: {proc_name}. Trust score: {trust_score_before} → {trust_score}")
+
+# ================== STORAGE FUNCTIONS ==================
+
+def store_payload(device_info: Dict, events: List[Dict]) -> int:
+    """
+    Store payload and events to database and event_window buffer.
+    
+    Does NOT:
+    - Calculate trust_score
+    - Call analyze_behavior()
+    
+    Returns:
+    - Number of events stored
+    """
+    if not events:
+        return 0
+    
+    print(f"[Debug] Payload received: {len(events)} events from {device_info.get('device_id', 'unknown')}")
+    
     device_id = device_info.get("device_id") or "unknown"
-    events = payload.get("events", [])
+    hostname = device_info.get("hostname", "unknown")
+    os_name = device_info.get("os", "unknown")
+    os_version = device_info.get("os_version", "unknown")
+    architecture = device_info.get("architecture", "unknown")
+    current_time = datetime.now(timezone.utc).isoformat()
+
+    # Track device in global dictionary
+    if device_id not in devices:
+        devices[device_id] = {
+            "device_id": device_id,
+            "hostname": hostname,
+            "os": os_name,
+            "os_version": os_version,
+            "architecture": architecture,
+            "trust_score": trust_score,
+            "last_seen": current_time,
+        }
+    else:
+        devices[device_id]["trust_score"] = trust_score
+        devices[device_id]["last_seen"] = current_time
 
     conn = get_db_connection()
     try:
         cur = conn.cursor()
         now = datetime.now(timezone.utc).isoformat()
         now_ts = datetime.now(timezone.utc).timestamp()
-
-        _cleanup_old_device_risk_state(now_ts)
-        state = _get_device_risk_state(device_id, now_ts)
-
-        # Update device
+        
+        # Update device information
         cur.execute("""
         INSERT INTO devices (id, hostname, os, os_version, architecture, last_seen, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET last_seen = excluded.last_seen
         """, (device_id, device_info.get("hostname"), device_info.get("os"), 
               device_info.get("os_version"), device_info.get("architecture"), now, now))
-
-        # Batch record to DB (same connection/cursor to avoid nested write locks)
+        
+        # Record events to database
         record_events_batch(cur, device_id, events, now)
+        
+        # Append events to sliding window buffer (deque automatically maintains max size)
+        global event_window
+        processed_events = []
+        for event in events:
+            event_type = event.get("event_type", "unknown")
 
-        # Batch AI processing
-        observed_severity, score_impact, saw_recon, saw_attack = calculate_trust_impact(device_id, events, now_ts)
+            # Ignore heartbeat events — they are keep-alive signals, not security telemetry
+            if event_type == "heartbeat":
+                continue
 
-        escalated_chain = saw_attack and (now_ts <= state.get("recon_only_until", 0.0))
-        correlated_penalty_applied = escalated_chain and score_impact > 0
-        if correlated_penalty_applied:
-            score_impact += CHAIN_ESCALATION_BONUS
-            state["compromised_until"] = max(state.get("compromised_until", 0.0), now_ts + COMPROMISED_RECOVERY_SECONDS)
+            # Process intelligence filtering
+            proc_name = (event.get("process_name") or "").lower()
 
-        if saw_recon:
-            state["recon_until"] = max(state.get("recon_until", 0.0), now_ts + RECON_CONTEXT_SECONDS)
-            if not saw_attack:
-                state["recon_only_until"] = max(state.get("recon_only_until", 0.0), now_ts + RECON_CONTEXT_SECONDS)
-            else:
-                state["recon_only_until"] = 0.0
+            # SAFE_PROCESSES → ignore completely, do not store in event_window
+            if proc_name in SAFE_PROCESSES:
+                continue
 
-        # Any strong attack (even without recon history) should trigger slower recovery period.
-        if observed_severity in ("high", "critical"):
-            state["compromised_until"] = max(state.get("compromised_until", 0.0), now_ts + COMPROMISED_RECOVERY_SECONDS)
+            # KNOWN_MALWARE → immediate critical alert + score reduction
+            if proc_name in KNOWN_MALWARE:
+                event["severity"] = "critical"
+                event["event_type"] = "known_malware"
+                _handle_malware_detection(device_id, proc_name, event, now_ts)
 
-        cur.execute("SELECT trust_score FROM devices WHERE id = ?", (device_id,))
-        row = cur.fetchone()
-        current_score = float(row["trust_score"]) if row else 100.0
+            # SUSPICIOUS_PROCESSES → tag for monitoring (flows into analyze_behavior)
+            elif proc_name in SUSPICIOUS_PROCESSES:
+                if event.get("severity") not in ("high", "critical"):
+                    event["severity"] = "high"
+                if event_type not in ("suspicious_process", "known_malware"):
+                    event["event_type"] = "suspicious_process"
 
-        if score_impact > 0:
-            # Apply penalty only when outside cooldown for the same detection signature.
-            new_score = max(0.0, current_score - score_impact)
-        else:
-            if now_ts <= state.get("compromised_until", 0.0):
-                # Correlated or strong attack context: recover slowly.
-                recovery_delta = SLOW_RECOVERY_PER_CYCLE
-            elif now_ts <= state.get("recon_until", 0.0):
-                # Recon without dangerous follow-up: recover very fast.
-                recovery_delta = FAST_RECOVERY_PER_CYCLE
-            else:
-                recovery_delta = RECOVERY_PER_CYCLE
+            event_with_metadata = {
+                "device_id": device_id,
+                "timestamp": now_ts,
+                **event
+            }
+            processed_events.append(event_with_metadata)
+            print(f"[Debug] Event appended to window: {event.get('event_type', 'unknown')} from {event.get('process_name', 'unknown')}")
+            
+            # Insert into logs table using SQLite INSERT query
+            cur.execute(
+                "INSERT INTO logs (device_id, process_name, event_type, severity, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (
+                    device_id,
+                    event.get("process_name", "Unknown"),
+                    event_type,
+                    event.get("severity", "low"),
+                    safe_float_ts(event.get("timestamp"), fallback=now_ts)
+                )
+            )
 
-            new_score = min(100.0, current_score + recovery_delta)
-
-        cur.execute("UPDATE devices SET trust_score = ? WHERE id = ?", (new_score, device_id))
-        score = new_score
+        # Store entire payload in event_window so analyze_behavior() can iterate nested events
+        if processed_events:
+            event_window.append({
+                "device_id": device_id,
+                "events": processed_events
+            })
+        
+        # Run analysis immediately after storing payload
+        run_analysis()
+        print("Analyzer executed")
+        
+        # Update last_risk_event for display
+        global last_risk_event
+        most_recent = events[-1]  # Usually last event in batch is most recent
+        last_risk_event = {
+            "event_type": most_recent.get("event_type", "Unknown"),
+            "description": most_recent.get("description") or most_recent.get("details", {}).get("description") or "No details",
+            "timestamp": safe_float_ts(most_recent.get("timestamp"), fallback=now_ts),
+            "severity": most_recent.get("severity", "low"),
+            "process_name": most_recent.get("process_name", "Unknown"),
+        }
+        
         conn.commit()
+        print(f"[Debug] Calling analyze_behavior() — {len(events)} events stored")
+        return len(events)
+    
     except sqlite3.OperationalError as exc:
         conn.rollback()
-        return jsonify({"error": f"database error: {exc}"}), 503
-    except Exception:
+        raise
+    except Exception as e:
         conn.rollback()
+        print(f"[ERROR] store_payload: {e}")
         raise
     finally:
         conn.close()
 
+# ================== ROUTES ==================
+
+@app.route("/api/logs", methods=["GET"])
+def get_logs():
+    """Get last 100 logs ordered by timestamp DESC"""
+    try:
+        logs = get_all_logs(limit=100)
+        return jsonify({
+            "events": logs
+        }), 200
+    except Exception as e:
+        print(f"[ERROR] get_logs: {e}")
+        return jsonify({"events": [], "error": str(e)}), 500
+
+@app.route("/api/trust-history", methods=["GET"])
+def get_trust_history():
+    """Get trust score change history (last 500 entries)"""
     return jsonify({
-        "status": "success",
-        "trust_score": round(score, 1),
-        "feedback": (
-            "CRITICAL: Correlated attack pattern" if correlated_penalty_applied
-            else "CRITICAL: Threat detected" if observed_severity == "critical"
-            else "WARNING: Suspicious activity" if observed_severity == "high"
-            else "WARNING: Monitor activity" if observed_severity in ("medium", "low")
-            else "Secure" if score > 75
-            else "WARNING: Low trust score"
+        "history": list(trust_score_history)
+    }), 200
+
+@app.route("/api/alerts", methods=["GET"])
+def get_security_alerts():
+    """Get recent security alerts (last 100 entries)"""
+    return jsonify({
+        "alerts": list(security_alerts)
+    }), 200
+
+@app.route("/api/debug-events", methods=["GET"])
+def debug_events():
+    """Debug endpoint: show raw event_window contents"""
+    return jsonify({
+        "window_size": len(event_window),
+        "events": list(event_window)
+    }), 200
+
+@app.route("/api/devices", methods=["GET"])
+def get_devices():
+    """Get list of tracked devices with current status"""
+    device_list = []
+    for d in devices.values():
+        score = d.get("trust_score", 100)
+        if score >= 70:
+            status = "Protected"
+        elif score >= 40:
+            status = "At Risk"
+        else:
+            status = "Critical"
+        device_list.append({
+            "device_id": d.get("device_id"),
+            "hostname": d.get("hostname"),
+            "os": d.get("os"),
+            "os_version": d.get("os_version"),
+            "architecture": d.get("architecture"),
+            "trust_score": score,
+            "status": status,
+            "last_seen": d.get("last_seen"),
+        })
+    return jsonify({"devices": device_list}), 200
+
+@app.route("/api/devices/<device_id>", methods=["GET"])
+def get_device_detail(device_id):
+    """Get detailed info for a single device including recent alerts"""
+    d = devices.get(device_id)
+    if not d:
+        return jsonify({"error": "Device not found"}), 404
+
+    score = d.get("trust_score", 100)
+    if score >= 70:
+        status = "Protected"
+    elif score >= 40:
+        status = "At Risk"
+    else:
+        status = "Critical"
+
+    # Gather recent alerts (from security_alerts deque)
+    device_alerts = [
+        a for a in security_alerts
+        if a.get("process_name") or True  # include all alerts (global scope)
+    ]
+    # Return most recent 10
+    recent = sorted(device_alerts, key=lambda a: a.get("timestamp", ""), reverse=True)[:10]
+
+    return jsonify({
+        "device": {
+            "device_id": d.get("device_id"),
+            "hostname": d.get("hostname"),
+            "os": d.get("os"),
+            "os_version": d.get("os_version"),
+            "architecture": d.get("architecture"),
+            "trust_score": score,
+            "status": status,
+            "last_seen": d.get("last_seen"),
+            "recent_alerts": recent,
+        }
+    }), 200
+
+@app.route("/api/logs", methods=["POST"])
+def receive_logs():
+    """
+    API endpoint to receive and store logs.
+    Appends payload to event_window and triggers analysis.
+    Also stores agent telemetry in the database.
+    """
+    global agent_connected
+    agent_connected = True
+    payload = request.get_json()
+    if not payload: 
+        return jsonify({"error": "No payload"}), 400
+
+    print("[Debug] Payload received:", payload)
+
+    device_info = payload.get("device", {})
+    events = payload.get("events", [])
+
+    # Store each event in the logs table
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    for event in events:
+        cursor.execute(
+            "INSERT INTO logs (device_id, event_type, process_name, cmdline, timestamp) VALUES (?, ?, ?, ?, ?)",
+            (
+                device_info.get("id", ""),
+                event.get("event_type", ""),
+                event.get("process_name", ""),
+                event.get("cmdline", ""),
+                event.get("timestamp", "")
+            )
         )
-    }), 201
+    conn.commit()
+    conn.close()
+
+    try:
+        if events:
+            num_stored = store_payload(device_info, events)
+        else:
+            num_stored = 0
+
+        # Always return trust_score and feedback (last risk event description)
+        global trust_score, last_risk_event
+        feedback_msg = last_risk_event["description"] if last_risk_event and "description" in last_risk_event else ""
+        response = {
+            "status": "success",
+            "message": f"Stored {num_stored} event(s)",
+            "buffer_size": len(event_window),
+            "trust_score": trust_score,
+            "feedback": feedback_msg
+        }
+        return jsonify(response), 201
+    except sqlite3.OperationalError as exc:
+        return jsonify({"error": f"database error: {exc}"}), 503
+    except Exception as e:
+        print(f"[ERROR] receive_logs: {e}")
+        return jsonify({"error": "Failed to store payload"}), 500
 
 @app.route("/api/status", methods=["GET"])
 def get_status():
@@ -404,6 +941,945 @@ def get_status():
     finally:
         conn.close()
 
+@app.route("/api/system-status", methods=["GET"])
+def get_system_status():
+    """Get global system state (trust score, status, last risk event, isolation state)"""
+    # Ensure lastEvent timestamp is always ISO string
+    event = last_risk_event.copy() if last_risk_event else None
+    if event and "timestamp" in event:
+        ts = event["timestamp"]
+        try:
+            # If already ISO string
+            if isinstance(ts, str) and "T" in ts:
+                event["timestamp"] = ts
+            else:
+                # Try float timestamp
+                event["timestamp"] = datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+        except Exception:
+            event["timestamp"] = datetime.now(timezone.utc).isoformat()
+    return jsonify({
+        "trustScore": round(trust_score, 1),
+        "systemStatus": system_status,
+        "lastEvent": event,
+        "isIsolated": system_status == "Isolated",
+        "protectionActive": protection_active
+    }), 200
+
+@app.route("/api/threat-history", methods=["GET"])
+def get_threat_history():
+    """Get timeline of threats ordered by timestamp DESC"""
+    try:
+        threats = get_all_threats()
+        return jsonify({
+            "threats": threats
+        }), 200
+    except Exception as e:
+        print(f"[ERROR] get_threat_history: {e}")
+        return jsonify({"threats": [], "error": str(e)}), 500
+
+@app.route("/api/reset-monitoring", methods=["POST"])
+def reset_monitoring():
+    """Reset all monitoring data and restore trust score to 100."""
+    global trust_score, system_status, last_risk_event, is_isolated, protection_active
+
+    # Clear in-memory buffers
+    security_alerts.clear()
+    trust_score_history.clear()
+    event_window.clear()
+    last_risk_event = None
+    is_isolated = False
+
+    # Clear threat_history and logs tables in the database
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM threat_history")
+        cur.execute("DELETE FROM logs")
+        conn.commit()
+    except Exception as e:
+        print(f"[Reset] Error clearing database tables: {e}")
+    finally:
+        conn.close()
+
+    # Reset trust score and system status
+    trust_score = 100.0
+    system_status = "Protected"
+    record_trust_score_change(trust_score)
+    protection_active = True
+
+    print("[System] Protection started — buffers cleared, trust score reset to 100")
+    print("[System] Protection started — buffers cleared, trust score reset to 100")
+    return jsonify({
+        "status": "success",
+        "protection_active": True,
+        "message": "Protection started. All monitoring buffers cleared and trust score reset."
+    }), 200
+
+@app.route("/api/stop-protection", methods=["POST"])
+def stop_protection():
+    """Disable protection — analysis will skip events."""
+    global protection_active
+    protection_active = False
+    print("[System] Protection stopped")
+    return jsonify({"status": "success", "protection_active": False}), 200
+
+@app.route("/api/system/restore", methods=["POST"])
+def restore_system_endpoint():
+    """
+    API endpoint to restore system from isolated state.
+    
+    Requirements:
+    - Only allow if system_status == "Isolated"
+    - Reset trust_score to 80
+    - Set system_status to "Protected"
+    - Reset is_isolated flag
+    """
+    global trust_score, system_status, is_isolated
+    
+    # Simulate admin authorization for now
+    auth_header = request.headers.get('Authorization', '')
+    # Simple authorization check - in production, this should be proper JWT/OAuth
+    
+    if system_status != "Isolated":
+        return jsonify({
+            "error": "System is not isolated",
+            "status": system_status
+        }), 400
+    
+    # Restore the system
+    trust_score = 80
+    system_status = "Protected"
+    is_isolated = False
+    
+    return jsonify({
+        "status": "success",
+        "message": "System restored from isolated state",
+        "trustScore": round(trust_score, 1),
+        "systemStatus": system_status,
+        "isIsolated": False
+    }), 200
+
+def restore_system() -> bool:
+    """
+    Restore system by enabling all network adapters using PowerShell.
+    
+    Requirements:
+    - Requires administrator privileges
+    - Only runs if system_status == "Isolated"
+    - Wraps in try/except with logging
+    
+    Returns:
+    - True if restoration successful
+    - False if restoration failed or not isolated
+    """
+    global system_status
+    
+    # Only restore if currently isolated
+    if system_status != "Isolated":
+        print("[Restoration] System is not isolated, skipping network restore")
+        return False
+    
+    try:
+        # PowerShell command to enable all network adapters
+        ps_command = "Enable-NetAdapter -Name '*' -Confirm:$false"
+        
+        # Run PowerShell command 
+        result = subprocess.run(
+            ["powershell", "-Command", ps_command],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        if result.returncode == 0:
+            print(f"[Restoration] Network adapters enabled successfully")
+            return True
+        else:
+            print(f"[Restoration] Failed to enable network adapters. Error: {result.stderr}")
+            return False
+    
+    except subprocess.TimeoutExpired:
+        print("[Restoration] PowerShell command timed out")
+        return False
+    except Exception as e:
+        print(f"[Restoration] Error restoring network: {e}")
+        return False
+
+@app.route("/api/restore", methods=["POST"])
+def restore_api():
+    """
+    API endpoint to restore system from isolated state.
+    
+    Steps:
+    1. Call restore_system() to enable network adapters
+    2. Reset trust_score to 40
+    3. Update system_status to "Critical"
+    4. Return success response
+    """
+    global trust_score, system_status, is_isolated
+    
+    try:
+        # Enable network adapters
+        restore_system()
+        
+        # Reset trust_score and update status
+        trust_score = 40
+        system_status = "Critical"
+        is_isolated = False
+        
+        return jsonify({
+            "status": "success",
+            "message": "System restored with network enabled",
+            "trustScore": round(trust_score, 1),
+            "systemStatus": system_status,
+            "isIsolated": False
+        }), 200
+
+    except Exception as e:
+        print(f"[API] Error in /api/restore: {e}")
+        return jsonify({"error": "Failed to restore system"}), 500
+
+def is_pattern_cooled_down(pattern_name: str, now_ts: float) -> bool:
+    """Check if pattern was detected in last 30 seconds, return True if cooldown expired.
+    Uses last_trigger_time dict to prevent repeated score reductions for same threat type."""
+    if pattern_name not in last_trigger_time:
+        return True
+    last_detection_ts = last_trigger_time[pattern_name]
+    return (now_ts - last_detection_ts) >= ALERT_COOLDOWN_SECONDS_PATTERN
+
+def mark_pattern_detected(pattern_name: str, now_ts: float):
+    """Record the timestamp when this threat type last triggered a score reduction."""
+    last_trigger_time[pattern_name] = now_ts
+
+# Only analyze security-related event types
+ALLOWED_EVENTS = [
+    "failed_login",
+    "privilege_escalation",
+    "persistence_created",
+    "suspicious_process",
+    "suspicious_file",
+    "network_beacon",
+    "network_connection",
+    "registry_modification",
+    "process_start",
+]
+
+# Minimum event thresholds — avoid triggering from single/few events
+# Event types not listed here trigger on any occurrence (e.g. persistence, priv esc)
+EVENT_THRESHOLDS = {
+    "failed_login": 10,       # 10+ failed logins in 30s
+    "suspicious_process": 3,  # 3+ suspicious processes in 30s
+    "suspicious_file": 3,     # 3+ suspicious files in 30s
+}
+
+# Noise event types that should never be analyzed
+ANALYZER_IGNORED_EVENT_TYPES = {"ui_click", "navigation", "heartbeat"}
+
+# Only analyze events from the agent — ignore frontend/UI sources
+ANALYZER_IGNORED_SOURCES = {"frontend", "ui"}
+
+# ================== COMMAND LINE INSPECTION ==================
+
+_PS_SUSPICIOUS_KEYWORDS = [
+    "encodedcommand", "-enc",
+    "invoke-webrequest", "downloadstring",
+    "invoke-expression",
+]
+
+_CMD_SUSPICIOUS_KEYWORDS = [
+    "net user", "net localgroup",
+    "whoami", "sc create", "reg add",
+]
+
+def is_suspicious_command(process_name: str, cmdline: str) -> bool:
+    """Return True if the command line contains suspicious keywords for the given process.
+
+    powershell.exe / pwsh.exe → check for encoded commands, download cradles, invoke-expression.
+    cmd.exe → check for recon / persistence commands (net user, reg add, etc.).
+    Other processes → always False (not inspected here).
+    """
+    if not cmdline:
+        return False
+    cmdline_lower = cmdline.lower()
+    pname = process_name.lower()
+    if pname in ("powershell.exe", "pwsh.exe"):
+        return any(kw in cmdline_lower for kw in _PS_SUSPICIOUS_KEYWORDS)
+    if pname == "cmd.exe":
+        return any(kw in cmdline_lower for kw in _CMD_SUSPICIOUS_KEYWORDS)
+    return False
+
+def run_analysis():
+    """
+    Single-pass analysis that detects suspicious patterns in event_window.
+    
+    Patterns detected (with 30-second cooldown per pattern):
+    - 10+ failed_login events in 30 seconds → -10 trust_score
+    - Any persistence_created event → -20 trust_score
+    - Any privilege_escalation event → -25 trust_score
+    - Network anomalies → -15 trust_score
+    - Suspicious process: same process_name >3 times in 20s → -15 trust_score
+    
+    Updates last_risk_event and system_status accordingly.
+    Inserts into threat_history table whenever trust_score is reduced.
+    Called directly after each payload is stored and also periodically by the background thread.
+    """
+    global trust_score, system_status, last_risk_event
+
+    # Skip analysis if protection is not active
+    if not protection_active:
+        return
+
+    # Analyze last 200 events
+    print(f"[Debug] Analyzing events in window: {len(event_window)}")
+    if len(event_window) == 0:
+        return
+    
+    # Flatten events from payload format: each item in event_window
+    # is a payload dict with {"device_id": ..., "events": [...]}
+    all_events = []
+    for payload in list(event_window):
+        for event in payload.get("events", []):
+            all_events.append(event)
+
+    # Filter to only security-related events with valid required fields
+    recent_events_list = []
+    for e in all_events[-200:]:
+        print("Analyzing event:", e)
+        etype = e.get("event_type")
+        pname = e.get("process_name")
+        tstamp = safe_float_ts(e.get("timestamp"))
+        source = (e.get("source") or "").lower()
+
+        # Only analyze events from the agent
+        if source in ANALYZER_IGNORED_SOURCES:
+            continue
+        if source and source != "agent":
+            continue
+
+        # Skip events missing required fields
+        if not etype or not pname or not tstamp:
+            continue
+
+        # Skip noise / non-security event types
+        if etype in ANALYZER_IGNORED_EVENT_TYPES:
+            continue
+        if etype not in ALLOWED_EVENTS:
+            continue
+
+        # Skip events with unknown/null process_name
+        if pname in ("unknown", "Unknown", "None") or pname is None:
+            continue
+
+        # Allow normal shell launches (cmd/powershell without malicious commands)
+        if pname in ("cmd.exe", "powershell.exe", "pwsh.exe"):
+            cmdline = (
+                e.get("cmdline")
+                or e.get("command_line")
+                or e.get("process_name")
+                or ""
+            ).lower()
+            # Escalate severity/risk for suspicious command lines
+            if ("-enc" in cmdline or "-encodedcommand" in cmdline
+                or any(rs in cmdline for rs in ["nc.exe", "ncat", "bash -i", "powershell -nop -w hidden -c", "socket", "connect", "reverse shell"])
+                or any(ac in cmdline for ac in ["net user", "add user", "net localgroup administrators", "add"])
+                or any(s in cmdline for s in ["download", "invoke-webrequest", "iex", "curl", "wget", "bypass", "payload", "meterpreter"])):
+                e["severity"] = "critical"
+                e["risk"] = "critical"
+                print(f"[Analyzer] Escalated severity for suspicious command line: {cmdline}")
+            else:
+                # If not suspicious, skip
+                continue
+                continue
+
+        recent_events_list.append(e)
+    
+    if not recent_events_list:
+        return
+
+    # Immediately penalize any event with severity/risk critical
+    for e in recent_events_list:
+        if (e.get("severity") == "critical" or e.get("risk") == "critical") and not e.get("trust_score_penalized"):
+            trust_score_before = trust_score
+            trust_score = max(0.0, trust_score - 20)
+            record_trust_score_change(trust_score)
+            record_security_alert("critical_event", e.get("process_name", "unknown"), "critical", trust_score, trust_score_before)
+            print(f"[CRITICAL EVENT] Trust score dropped for: {e.get('process_name', 'unknown')} | Command: {e.get('cmdline', '')[:200]}")
+            e["trust_score_penalized"] = True
+    
+    now_ts = datetime.now(timezone.utc).timestamp()
+            
+    # Immediate malware detection — check before any pattern analysis
+    for e in recent_events_list:
+        pname = (e.get("process_name") or "").lower()
+        if pname in KNOWN_MALWARE and is_pattern_cooled_down(f"malware_{pname}", now_ts):
+            mark_pattern_detected(f"malware_{pname}", now_ts)
+            trust_score_before = trust_score
+            trust_score = max(0.0, trust_score - 30)
+            record_trust_score_change(trust_score)
+            record_security_alert("known_malware", pname, "critical", trust_score, trust_score_before)
+            print(f"[Debug] Suspicious pattern detected: known_malware")
+            print(f"[Debug] Trust score updated: {trust_score}")
+            current_time = datetime.now(timezone.utc).isoformat()
+            last_risk_event = {
+                "event_type": "known_malware",
+                "description": f"Known malware detected: {pname}",
+                "timestamp": current_time,
+                "severity": "critical",
+                "pattern": f"malware_{pname}",
+                "process_name": pname,
+            }
+            # Insert into threat_history table
+            db_conn = get_db_connection()
+            try:
+                cur = db_conn.cursor()
+                cur.execute(
+                    "INSERT INTO threat_history (event_type, severity, trust_score_before, trust_score_after, timestamp) VALUES (?, ?, ?, ?, ?)",
+                    ("known_malware", "critical", trust_score_before, trust_score, current_time)
+                )
+                # Insert into logs table
+                cur.execute(
+                    "INSERT INTO logs (device_id, process_name, event_type, severity, timestamp) VALUES (?, ?, ?, ?, ?)",
+                    (e.get("device_id", "unknown"), pname, "known_malware", "critical", current_time)
+                )
+                db_conn.commit()
+            finally:
+                db_conn.close()
+            update_system_status()
+            print(f"[MALWARE] Known malware detected in analysis: {pname}. Trust score: {trust_score_before} → {trust_score}")
+
+    # Behavior check: PowerShell / CMD suspicious command-line keywords
+    # Only triggers on genuinely dangerous patterns — normal shell usage is ignored.
+    for e in recent_events_list:
+        pname = (e.get("process_name") or "").lower()
+        if pname not in ("powershell.exe", "pwsh.exe", "cmd.exe"):
+            continue
+        cmdline = (
+            e.get("cmdline")
+            or e.get("command_line")
+            or e.get("process_name")
+            or ""
+        ).lower()
+        if not is_suspicious_command(pname, cmdline):
+            continue
+        if is_pattern_cooled_down(f"suspicious_cmdline_{pname}", now_ts):
+            mark_pattern_detected(f"suspicious_cmdline_{pname}", now_ts)
+            trust_score_before = trust_score
+            trust_score = max(0.0, trust_score - 20)
+            record_trust_score_change(trust_score)
+            record_security_alert("suspicious_cmdline", pname, "critical", trust_score, trust_score_before)
+            current_time = datetime.now(timezone.utc).isoformat()
+            print(f"[ATTACK DETECTED]")
+            print(f"Process: {pname}")
+            print(f"Command: {cmdline[:200]}")
+            print(f"Trust Score Impact: -20")
+            last_risk_event = {
+                "event_type": "suspicious_cmdline",
+                "description": f"Suspicious command detected in {pname}",
+                "timestamp": current_time,
+                "severity": "critical",
+                "pattern": f"suspicious_cmdline_{pname}",
+                "process_name": pname,
+            }
+            db_conn = get_db_connection()
+            try:
+                cur = db_conn.cursor()
+                cur.execute(
+                    "INSERT INTO threat_history (event_type, severity, trust_score_before, trust_score_after, timestamp) VALUES (?, ?, ?, ?, ?)",
+                    ("suspicious_cmdline", "critical", trust_score_before, trust_score, current_time)
+                )
+                cur.execute(
+                    "INSERT INTO logs (device_id, process_name, event_type, severity, timestamp) VALUES (?, ?, ?, ?, ?)",
+                    (e.get("device_id", "unknown"), pname, "suspicious_cmdline", "critical", current_time)
+                )
+                db_conn.commit()
+            finally:
+                db_conn.close()
+            update_system_status()
+
+    # ---- Explicit attack detection rules ----
+    # Each rule inspects process_name + cmdline for specific attack signatures.
+    # Rules use per-pattern 30-second cooldown to avoid duplicate penalties.
+    ATTACK_RULES = [
+        {
+            "name": "reverse_shell",
+            "severity": "critical",
+            "penalty": 30,
+            "description": "Reverse shell attempt detected",
+            "match": lambda pname, cmdline: "nc.exe" in pname,
+        },
+        {
+            "name": "privilege_enum",
+            "severity": "medium",
+            "penalty": 10,
+            "description": "Privilege enumeration detected (whoami /priv)",
+            "match": lambda pname, cmdline: "whoami /priv" in cmdline,
+        },
+        {
+            "name": "admin_creation",
+            "severity": "critical",
+            "penalty": 25,
+            "description": "Local admin account creation attempt",
+            "match": lambda pname, cmdline: "net user" in cmdline and pname == "cmd.exe",
+        },
+        {
+            "name": "persistence_reg_run",
+            "severity": "critical",
+            "penalty": 20,
+            "description": "Registry Run key persistence detected",
+            "match": lambda pname, cmdline: "reg add" in cmdline and "currentversion\\run" in cmdline,
+        },
+        {
+            "name": "encoded_powershell",
+            "severity": "critical",
+            "penalty": 20,
+            "description": "Encoded PowerShell execution detected",
+            "match": lambda pname, cmdline: pname in ("powershell.exe", "pwsh.exe") and ("-enc " in cmdline or cmdline.endswith("-enc") or "-encodedcommand" in cmdline),
+        },
+    ]
+
+    for e in recent_events_list:
+        pname = (e.get("process_name") or "").lower()
+        cmdline = (
+            e.get("cmdline")
+            or e.get("command_line")
+            or e.get("process_name")
+            or ""
+        ).lower()
+        for rule in ATTACK_RULES:
+            if not rule["match"](pname, cmdline):
+                continue
+            pattern_key = f"attack_{rule['name']}_{pname}"
+            if not is_pattern_cooled_down(pattern_key, now_ts):
+                continue
+            mark_pattern_detected(pattern_key, now_ts)
+            trust_score_before = trust_score
+            trust_score = max(0.0, trust_score - rule["penalty"])
+            record_trust_score_change(trust_score)
+            record_security_alert(rule["name"], pname, rule["severity"], trust_score, trust_score_before)
+            current_time = datetime.now(timezone.utc).isoformat()
+            last_risk_event = {
+                "event_type": rule["name"],
+                "description": rule["description"],
+                "timestamp": current_time,
+                "severity": rule["severity"],
+                "pattern": pattern_key,
+                "process_name": pname,
+            }
+            db_conn = get_db_connection()
+            try:
+                cur = db_conn.cursor()
+                cur.execute(
+                    "INSERT INTO threat_history (event_type, severity, trust_score_before, trust_score_after, timestamp) VALUES (?, ?, ?, ?, ?)",
+                    (rule["name"], rule["severity"], trust_score_before, trust_score, current_time)
+                )
+                cur.execute(
+                    "INSERT INTO logs (device_id, process_name, event_type, severity, timestamp) VALUES (?, ?, ?, ?, ?)",
+                    (e.get("device_id", "unknown"), pname, rule["name"], rule["severity"], current_time)
+                )
+                db_conn.commit()
+            finally:
+                db_conn.close()
+            update_system_status()
+            print(f"[ATTACK DETECTED]")
+            print(f"Process: {pname}")
+            print(f"Command: {cmdline[:200]}")
+            print(f"Trust Score Impact: -{rule['penalty']}")
+
+    # Pattern 1: Failed login burst (10+ in 30 seconds)
+    failed_logins = [
+        e for e in recent_events_list 
+        if e.get("event_type") == "failed_login" 
+        and (now_ts - safe_float_ts(e.get("timestamp"), fallback=0)) < 30
+    ]
+    if len(failed_logins) > EVENT_THRESHOLDS["failed_login"] and is_pattern_cooled_down("failed_login_burst", now_ts):
+        mark_pattern_detected("failed_login_burst", now_ts)
+        trust_score_before = trust_score
+        trust_score = max(0.0, trust_score - 10)
+        record_trust_score_change(trust_score)
+        record_security_alert("failed_login_burst", failed_logins[0].get("process_name", "unknown"), "critical", trust_score, trust_score_before)
+        print(f"[Debug] Suspicious pattern detected: failed_login_burst")
+        print(f"[Debug] Trust score updated: {trust_score}")
+        current_time = datetime.now(timezone.utc).isoformat()
+        last_risk_event = {
+            "event_type": "failed_login_burst",
+            "description": f"Failed login burst detected: {len(failed_logins)} attempts in 30 seconds",
+            "timestamp": current_time,
+            "severity": "critical",
+            "pattern": "failed_login_burst"
+        }
+        # Insert into threat_history and logs tables
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO threat_history (event_type, severity, trust_score_before, trust_score_after, timestamp) VALUES (?, ?, ?, ?, ?)",
+                ("failed_login_burst", "critical", trust_score_before, trust_score, current_time)
+            )
+            cur.execute(
+                "INSERT INTO logs (device_id, process_name, event_type, severity, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (failed_logins[0].get("device_id", "unknown"), failed_logins[0].get("process_name", "unknown"), "failed_login_burst", "critical", current_time)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        update_system_status()
+        print(f"[Analysis] Failed login burst detected. Trust score: {trust_score}")
+        return
+    
+    # Pattern 1b: Suspicious process burst detection
+    # Triggers when ALL conditions are met:
+    #   1. Same process_name appears >5 times within 15 seconds
+    #   2. Process is not in SAFE_PROCESSES
+    #   3. Command line is suspicious (via is_suspicious_command)
+    # Penalty: -10 trust score. Counter cleared after alert.
+    suspicious_counts: Dict[str, int] = {}
+    for e in recent_events_list:
+        pname = (e.get("process_name") or "").lower()
+        if pname in SAFE_PROCESSES:
+            continue
+        e_ts = safe_float_ts(e.get("timestamp"))
+        if (now_ts - e_ts) >= 15:
+            continue
+        cmdline = (
+            e.get("cmdline")
+            or e.get("command_line")
+            or e.get("process_name")
+            or ""
+        ).lower()
+        if not is_suspicious_command(pname, cmdline):
+            continue
+        suspicious_counts[pname] = suspicious_counts.get(pname, 0) + 1
+
+    for pname, count in suspicious_counts.items():
+        if count > 5 and is_pattern_cooled_down(f"suspicious_proc_{pname}", now_ts):
+            mark_pattern_detected(f"suspicious_proc_{pname}", now_ts)
+            trust_score_before = trust_score
+            trust_score = max(0.0, trust_score - 10)
+            record_trust_score_change(trust_score)
+            record_security_alert("suspicious_process_burst", pname, "high", trust_score, trust_score_before)
+            current_time = datetime.now(timezone.utc).isoformat()
+            last_risk_event = {
+                "event_type": "suspicious_process_burst",
+                "description": f"Suspicious process burst: {pname} appeared {count} times in 15 seconds with suspicious cmdline",
+                "timestamp": current_time,
+                "severity": "high",
+                "pattern": f"suspicious_proc_{pname}",
+                "process_name": pname,
+            }
+            db_conn = get_db_connection()
+            try:
+                cur = db_conn.cursor()
+                cur.execute(
+                    "INSERT INTO threat_history (event_type, severity, trust_score_before, trust_score_after, timestamp) VALUES (?, ?, ?, ?, ?)",
+                    ("suspicious_process_burst", "high", trust_score_before, trust_score, current_time)
+                )
+                cur.execute(
+                    "INSERT INTO logs (device_id, process_name, event_type, severity, timestamp) VALUES (?, ?, ?, ?, ?)",
+                    ("unknown", pname, "suspicious_process_burst", "high", current_time)
+                )
+                db_conn.commit()
+            finally:
+                db_conn.close()
+            update_system_status()
+            # Clear counter after alert to prevent re-firing on same batch
+            suspicious_counts[pname] = 0
+            print(f"[ATTACK DETECTED]")
+            print(f"Process: {pname}")
+            print(f"Command: (burst — {count}x in 15s)")
+            print(f"Trust Score Impact: -10")
+
+    # Pattern 1c: Suspicious file burst (3+ in 30 seconds)
+    suspicious_files = [
+        e for e in recent_events_list
+        if e.get("event_type") == "suspicious_file"
+        and (now_ts - safe_float_ts(e.get("timestamp"), fallback=0)) < 30
+    ]
+    if len(suspicious_files) >= EVENT_THRESHOLDS["suspicious_file"] and is_pattern_cooled_down("suspicious_file_burst", now_ts):
+        mark_pattern_detected("suspicious_file_burst", now_ts)
+        trust_score_before = trust_score
+        trust_score = max(0.0, trust_score - 10)
+        record_trust_score_change(trust_score)
+        record_security_alert("suspicious_file_burst", suspicious_files[0].get("process_name", "unknown"), "medium", trust_score, trust_score_before)
+        print(f"[Debug] Suspicious pattern detected: suspicious_file_burst")
+        print(f"[Debug] Trust score updated: {trust_score}")
+        current_time = datetime.now(timezone.utc).isoformat()
+        last_risk_event = {
+            "event_type": "suspicious_file_burst",
+            "description": f"Suspicious file burst: {len(suspicious_files)} suspicious files in 30 seconds",
+            "timestamp": current_time,
+            "severity": "medium",
+            "pattern": "suspicious_file_burst"
+        }
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO threat_history (event_type, severity, trust_score_before, trust_score_after, timestamp) VALUES (?, ?, ?, ?, ?)",
+                ("suspicious_file_burst", "medium", trust_score_before, trust_score, current_time)
+            )
+            cur.execute(
+                "INSERT INTO logs (device_id, process_name, event_type, severity, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (suspicious_files[0].get("device_id", "unknown"), suspicious_files[0].get("process_name", "unknown"), "suspicious_file_burst", "medium", current_time)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        update_system_status()
+        print(f"[Analysis] Suspicious file burst detected ({len(suspicious_files)} files). Trust score: {trust_score}")
+        return
+
+    # Pattern 2: Persistence created event (single event is critical)
+    persistence_events = [
+        e for e in recent_events_list 
+        if e.get("event_type") == "persistence_created"
+    ]
+    if persistence_events and is_pattern_cooled_down("persistence_detected", now_ts):
+        mark_pattern_detected("persistence_detected", now_ts)
+        trust_score_before = trust_score
+        trust_score = max(0.0, trust_score - 20)
+        record_trust_score_change(trust_score)
+        record_security_alert("persistence_created", persistence_events[0].get("process_name", "unknown"), "critical", trust_score, trust_score_before)
+        print(f"[Debug] Suspicious pattern detected: persistence_created")
+        print(f"[Debug] Trust score updated: {trust_score}")
+        current_time = datetime.now(timezone.utc).isoformat()
+        last_risk_event = {
+            "event_type": "persistence_created",
+            "description": f"Persistence mechanism detected: {persistence_events[0].get('description', 'Unknown')}",
+            "timestamp": current_time,
+            "severity": "critical",
+            "pattern": "persistence_detected"
+        }
+        # Insert into threat_history and logs tables
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO threat_history (event_type, severity, trust_score_before, trust_score_after, timestamp) VALUES (?, ?, ?, ?, ?)",
+                ("persistence_created", "critical", trust_score_before, trust_score, current_time)
+            )
+            cur.execute(
+                "INSERT INTO logs (device_id, process_name, event_type, severity, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (persistence_events[0].get("device_id", "unknown"), persistence_events[0].get("process_name", "unknown"), "persistence_created", "critical", current_time)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        update_system_status()
+        print(f"[Analysis] Persistence mechanism detected. Trust score: {trust_score}")
+        return
+    
+    # Pattern 3: Privilege escalation event
+    priv_esc_events = [
+        e for e in recent_events_list 
+        if e.get("event_type") == "privilege_escalation"
+    ]
+    if priv_esc_events and is_pattern_cooled_down("privilege_escalation_detected", now_ts):
+        mark_pattern_detected("privilege_escalation_detected", now_ts)
+        trust_score_before = trust_score
+        trust_score = max(0.0, trust_score - 25)
+        record_trust_score_change(trust_score)
+        record_security_alert("privilege_escalation", priv_esc_events[0].get("process_name", "unknown"), "critical", trust_score, trust_score_before)
+        print(f"[Debug] Suspicious pattern detected: privilege_escalation")
+        print(f"[Debug] Trust score updated: {trust_score}")
+        current_time = datetime.now(timezone.utc).isoformat()
+        last_risk_event = {
+            "event_type": "privilege_escalation",
+            "description": f"Privilege escalation detected: {priv_esc_events[0].get('description', 'Unknown')}",
+            "timestamp": current_time,
+            "severity": "critical",
+            "pattern": "privilege_escalation_detected"
+        }
+        # Insert into threat_history and logs tables
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO threat_history (event_type, severity, trust_score_before, trust_score_after, timestamp) VALUES (?, ?, ?, ?, ?)",
+                ("privilege_escalation", "critical", trust_score_before, trust_score, current_time)
+            )
+            cur.execute(
+                "INSERT INTO logs (device_id, process_name, event_type, severity, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (priv_esc_events[0].get("device_id", "unknown"), priv_esc_events[0].get("process_name", "unknown"), "privilege_escalation", "critical", current_time)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        update_system_status()
+        print(f"[Analysis] Privilege escalation detected. Trust score: {trust_score}")
+        return
+    
+    # Pattern 4: Network anomaly detection
+    # Only count connections to external public IPs within 10 seconds
+    def is_external_ip(ip):
+        """Return True if IP is a public/external address"""
+        if not ip:
+            return False
+        if ip in ("127.0.0.1", "localhost", "0.0.0.0", "::1"):
+            return False
+        if ip.startswith("192.168.") or ip.startswith("10.") or ip.startswith("172."):
+            return False
+        return True
+
+    network_events = [
+        e for e in recent_events_list 
+        if e.get("event_type") in ("network_connect", "network_connection", "network_beacon")
+        and (now_ts - safe_float_ts(e.get("timestamp"), fallback=0)) < 10
+        and is_external_ip(
+            e.get("destination_ip") or e.get("remote_ip") or ""
+        )
+    ]
+    
+    if len(network_events) > 50 and is_pattern_cooled_down("excessive_external_connections", now_ts):
+        mark_pattern_detected("excessive_external_connections", now_ts)
+        trust_score_before = trust_score
+        trust_score = max(0.0, trust_score - 15)
+        record_trust_score_change(trust_score)
+        record_security_alert("network_anomaly", network_events[0].get("process_name", "unknown"), "high", trust_score, trust_score_before)
+        print(f"[Debug] Suspicious pattern detected: network_anomaly")
+        print(f"[Debug] Trust score updated: {trust_score}")
+        current_time = datetime.now(timezone.utc).isoformat()
+        last_risk_event = {
+            "event_type": "network_anomaly",
+            "description": f"Excessive external connections: {len(network_events)} connections to public IPs in 10 seconds",
+            "timestamp": current_time,
+            "severity": "high",
+            "pattern": "excessive_external_connections"
+        }
+        db_conn = get_db_connection()
+        try:
+            cur = db_conn.cursor()
+            cur.execute(
+                "INSERT INTO threat_history (event_type, severity, trust_score_before, trust_score_after, timestamp) VALUES (?, ?, ?, ?, ?)",
+                ("network_anomaly", "high", trust_score_before, trust_score, current_time)
+            )
+            cur.execute(
+                "INSERT INTO logs (device_id, process_name, event_type, severity, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (network_events[0].get("device_id", "unknown"), network_events[0].get("process_name", "unknown"), "network_anomaly", "high", current_time)
+            )
+            db_conn.commit()
+        finally:
+            db_conn.close()
+        update_system_status()
+        print(f"[Analysis] Excessive external connections ({len(network_events)} in 10s). Trust score: {trust_score}")
+        return
+    
+    # === Automatic system isolation rule ===
+    global system_status
+    if trust_score <= 20 and system_status != "Isolated":
+        if isolate_system():
+            system_status = "Isolated"
+            record_security_alert(
+                "system_isolation",
+                "SYSTEM",
+                "critical",
+                trust_score,
+                trust_score + 0  # No change, just for alert
+            )
+            print("[ATTACK DETECTED]")
+            print("System automatically isolated due to critical threat activity")
+            print(f"Trust Score: {trust_score}")
+            last_risk_event = {
+                "event_type": "system_isolation",
+                "description": "System automatically isolated due to critical threat activity",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "severity": "critical",
+                "pattern": "system_isolation",
+                "process_name": "SYSTEM",
+            }
+            update_system_status()
+    # No patterns matched in this cycle
+    print("[Debug] No suspicious activity detected")
+
+
+def analyze_behavior():
+    """
+    Background analysis thread — periodic monitoring only.
+    run_analysis() is called exclusively from store_payload().
+    """
+    while True:
+        try:
+            time.sleep(5)
+            # Analysis is now triggered only by store_payload()
+        except Exception as e:
+            print(f"[Analysis] Error in behavior analysis thread: {e}")
+
+def recovery_loop():
+    """
+    Background recovery thread that restores trust_score over time.
+    
+    Every 15 seconds:
+    - If trust_score < 100 and system_status != "Isolated"
+    - Increase trust_score by 1
+    - Cap at 100
+    """
+    global trust_score, system_status
+    
+    while True:
+        try:
+            time.sleep(15)
+            
+            # Only recover if not isolated and not at max score
+            if trust_score < 100 and system_status != "Isolated":
+                trust_score = min(100.0, trust_score + 1)
+                print(f"[Recovery] Trust score increased to {trust_score}")
+        except Exception as e:
+            print(f"[Recovery] Error in recovery loop: {e}")
+
+def recovery_thread_worker():
+    """Background thread that recovers trust score every 10 seconds if not isolated"""
+    global trust_score, system_status
+    
+    while True:
+        try:
+            time.sleep(10)
+            
+            # Only recover if not isolated and not at max score
+            if trust_score < 100 and system_status != "Isolated":
+                trust_score = min(100.0, trust_score + 1)
+                print(f"[Recovery] Trust score increased to {trust_score}")
+        except Exception as e:
+            print(f"[Recovery] Error in recovery thread: {e}")
+
+def cleanup_loop():
+    """Background thread that auto-cleans monitoring data every 15 minutes."""
+    while True:
+        try:
+            time.sleep(900)  # 15 minutes
+
+            security_alerts.clear()
+            trust_score_history.clear()
+
+            conn = get_db_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM threat_history")
+                cur.execute("DELETE FROM logs")
+                conn.commit()
+            except Exception as e:
+                print(f"[Cleanup] Error clearing database tables: {e}")
+            finally:
+                conn.close()
+
+            print("[Cleanup] Monitoring data auto-cleaned")
+        except Exception as e:
+            print(f"[Cleanup] Error in cleanup thread: {e}")
+
 if __name__ == "__main__":
     init_db()
+    
+    # Start background analysis thread
+    analysis_thread = threading.Thread(target=analyze_behavior, daemon=True)
+    analysis_thread.start()
+    print("[System] Background behavior analysis thread started")
+    
+    # Start background recovery thread
+    recovery_thread = threading.Thread(target=recovery_loop, daemon=True)
+    recovery_thread.start()
+    print("[System] Background recovery loop started")
+
+    # Start background cleanup thread
+    cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True)
+    cleanup_thread.start()
+    print("[System] Background cleanup loop started (every 15 minutes)")
+    
     app.run(host="0.0.0.0", port=5000, debug=True)

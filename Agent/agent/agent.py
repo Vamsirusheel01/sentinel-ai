@@ -1,4 +1,5 @@
 import time
+import threading
 from datetime import datetime
 
 from agent.identity.identity import collect_identity
@@ -15,10 +16,37 @@ from agent.local_risk_evaluator.risk_evaluator import evaluate
 from agent.buffer.event_buffer import push, flush
 from agent.sender.sender import send
 
+HEARTBEAT_INTERVAL = 10  # seconds
+
+
+def heartbeat_loop(identity):
+    """Send a heartbeat event every 10 seconds so backend knows the agent is alive."""
+    while True:
+        try:
+            payload = {
+                "device": identity,
+                "events": [{
+                    "event_type": "heartbeat",
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "status": "alive"
+                }],
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            send(payload)
+            print(f"[Heartbeat] Sent at {datetime.now().strftime('%H:%M:%S')}")
+        except Exception as e:
+            print(f"[Heartbeat] Error: {e}")
+        time.sleep(HEARTBEAT_INTERVAL)
+
 
 def run():
     identity = collect_identity()
     print("[Sentinel Agent] Started. Identity:", identity)
+
+    # Start heartbeat thread (daemon — dies with main process)
+    hb_thread = threading.Thread(target=heartbeat_loop, args=(identity,), daemon=True)
+    hb_thread.start()
+    print("[Sentinel Agent] Heartbeat thread started (every 10s)")
 
     while True:
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Collecting telemetry...")
@@ -31,6 +59,8 @@ def run():
         events += collect_privilege_events()
 
         events = [normalize(e) for e in events]
+        for e in events:
+            e["source"] = "agent"
         events = deduplicate(events)
         events = correlate(events)
         events = evaluate(events)
@@ -66,5 +96,5 @@ def run():
         else:
             print("[Sentinel Agent] Warning: No feedback received from backend.")
 
-        # Faster polling improves capture of short-lived processes like whoami
-        time.sleep(1)
+        # Telemetry cycle every 5 seconds to reduce load
+        time.sleep(5)

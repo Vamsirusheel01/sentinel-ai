@@ -14,6 +14,12 @@ def send(payload):
     if not payload:
         return None
 
+    # Limit events per cycle to prevent flooding the backend
+    events = payload.get("events", [])
+    if len(events) > 10:
+        print(f"[Agent] Too many events ({len(events)}), limiting to 10")
+        payload["events"] = events[:10]
+
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
     # ---- Send to Local Server ----
