@@ -19,9 +19,7 @@ Zero Trust Endpoint Security System with Dynamic Trust Scoring.
 
 ## 👥 Team
 - Backend: Vamsi Pochampally
-- Agent: B Pavan Kumar
-- Documentation: Aakanksha
-- Presentation: Shivaram A
+- Agent: B Pavan Kumar 
 
 ## 📌 How to Run
 ```bash
