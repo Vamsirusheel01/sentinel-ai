@@ -3,7 +3,7 @@ import json
 from datetime import datetime
 
 API_URL = "http://127.0.0.1:5000/api/logs"
-TIMEOUT = 5
+TIMEOUT = 2
 
 
 def send(payload):

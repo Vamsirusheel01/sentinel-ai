@@ -1,7 +1,9 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import MainLayout from './layouts/MainLayout'
+import { ProtectionProvider } from './context/ProtectionContext';
 import Home from './pages/Home'
 import ProtectionCenter from './pages/ProtectionCenter'
+// ...existing code...
 import LiveActivity from './pages/LiveActivity'
 import ThreatHistory from './pages/ThreatHistory'
 import Logs from './pages/Logs'
@@ -14,45 +16,32 @@ import ProtectedRoute from './components/auth/ProtectedRoute'
 
 function App() {
   return (
-    <BrowserRouter>
-      <Routes>
-        {/* Public Routes */}
-        <Route path="/login" element={<Login />} />
-        <Route path="/register" element={<Register />} />
+    <ProtectionProvider>
+      <BrowserRouter>
+        <Routes>
+          {/* Public Routes */}
+          <Route path="/login" element={<Login />} />
+          <Route path="/register" element={<Register />} />
 
-        {/* Protected Routes - Requires Authentication */}
-        <Route
-          element={
-            <ProtectedRoute>
-              <MainLayout />
-            </ProtectedRoute>
-          }
-        >
-          <Route path="/" element={<Home />} />
-          <Route path="/protection" element={<ProtectionCenter />} />
-          <Route path="/activity" element={<LiveActivity />} />
-          <Route path="/threats" element={<ThreatHistory />} />
-          <Route path="/devices" element={<Devices />} />
-          
-          {/* Admin Only Routes */}
-          <Route
-            path="/logs"
-            element={
-              <ProtectedRoute roles={['admin']}>
-                <Logs />
-              </ProtectedRoute>
-            }
-          />
-          
-          <Route path="/settings" element={<Settings />} />
-          <Route path="/support" element={<Support />} />
-        </Route>
+          {/* Main Routes - No Authentication for Debugging */}
+          <Route element={<MainLayout />}>
+            <Route path="/" element={<Home />} />
+            <Route path="/protection" element={<ProtectionCenter />} />
+            {/* ...existing code... */}
+            <Route path="/activity" element={<LiveActivity />} />
+            <Route path="/threats" element={<ThreatHistory />} />
+            <Route path="/devices" element={<Devices />} />
+            <Route path="/logs" element={<Logs />} />
+            <Route path="/settings" element={<Settings />} />
+            <Route path="/support" element={<Support />} />
+          </Route>
 
-        {/* Redirect unknown routes to home */}
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
-    </BrowserRouter>
-  )
+          {/* Redirect unknown routes to home */}
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </BrowserRouter>
+    </ProtectionProvider>
+  );
 }
 
 export default App

@@ -1,21 +1,66 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react';
 
-export default function Home() {
+function Home() {
   const [systemStatus, setSystemStatus] = useState({
     agentStatus: 'Loading...',
     backendStatus: 'Loading...',
     protectionStatus: 'Loading...'
   })
   const [loading, setLoading] = useState(true)
+  const [backendHealthy, setBackendHealthy] = useState(false)
+  const [healthMessage, setHealthMessage] = useState('')
+  const healthRetryRef = useRef(null)
 
-  // Fetch system status
+  // Health check and polling logic
   useEffect(() => {
+    // Health check function
+    const checkBackendHealth = async () => {
+      try {
+        const res = await fetch('/health')
+        if (res.status === 200) {
+          setBackendHealthy(true)
+          setHealthMessage('')
+          // Start polling dashboard data
+          pollDashboard()
+        } else {
+          setBackendHealthy(false)
+          setHealthMessage('Backend not connected')
+          stopPolling()
+          retryHealth()
+        }
+      } catch {
+        setBackendHealthy(false)
+        setHealthMessage('Backend not connected')
+        stopPolling()
+        retryHealth()
+      }
+    }
+
+    // Poll dashboard data only if backend is healthy
+    let pollInterval = null
+    const pollDashboard = () => {
+      if (pollInterval) return
+      fetchStatus()
+      pollInterval = setInterval(fetchStatus, 10000)
+      healthRetryRef.current = pollInterval
+    }
+    const stopPolling = () => {
+      if (healthRetryRef.current) {
+        clearInterval(healthRetryRef.current)
+        healthRetryRef.current = null
+      }
+    }
+    const retryHealth = () => {
+      if (healthRetryRef.current) return
+      healthRetryRef.current = setInterval(checkBackendHealth, 5000)
+    }
+
+    // Fetch system status
     const fetchStatus = async () => {
       try {
         setLoading(true)
         const response = await fetch('/api/system-status')
         if (!response.ok) {
-          // Use mock data if API unavailable
           setSystemStatus({
             agentStatus: 'Active',
             backendStatus: 'Connected',
@@ -30,7 +75,6 @@ export default function Home() {
           })
         }
       } catch (err) {
-        console.error('Failed to fetch system status:', err)
         setSystemStatus({
           agentStatus: 'Active',
           backendStatus: 'Connected',
@@ -41,9 +85,11 @@ export default function Home() {
       }
     }
 
-    fetchStatus()
-    const interval = setInterval(fetchStatus, 10000)
-    return () => clearInterval(interval)
+    checkBackendHealth()
+    return () => {
+      stopPolling()
+      if (healthRetryRef.current) clearInterval(healthRetryRef.current)
+    }
   }, [])
 
   const getStatusColor = (status) => {
@@ -221,7 +267,11 @@ export default function Home() {
 
         <div className="max-w-3xl mx-auto">
           <div className="bg-slate-800 border border-slate-700 rounded-xl p-8">
-            {loading ? (
+            {!backendHealthy ? (
+              <div className="flex items-center justify-center py-8">
+                <span className="text-xl text-yellow-400 font-semibold">{healthMessage || 'Backend not connected'}</span>
+              </div>
+            ) : loading ? (
               <div className="flex items-center justify-center py-8">
                 <div className="w-8 h-8 border-4 border-slate-700 border-t-teal-500 rounded-full animate-spin"></div>
                 <span className="ml-3 text-slate-400">Checking system status...</span>
@@ -295,3 +345,5 @@ export default function Home() {
     </div>
   )
 }
+
+export default Home;

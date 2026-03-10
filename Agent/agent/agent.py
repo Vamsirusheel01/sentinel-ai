@@ -76,7 +76,7 @@ def run():
         print(f"\n[Sentinel Agent] Sending payload at {payload['timestamp']}")
         print(f"[Sentinel Agent] Total Events: {len(events)}")
         if events:
-            display_count = min(len(events), 10)
+            display_count = min(len(events), 50)
             print(f"[Sentinel Agent] Sample of first {display_count} events being sent:")
             for i, e in enumerate(events[:display_count]):
                 name = e.get('process_name', 'N/A')

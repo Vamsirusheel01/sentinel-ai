@@ -1,41 +1,68 @@
-@app.route("/api/system-status")
-def system_status():
-    global protection_active, agent_connected
-    return jsonify({
-        "protection_active": protection_active,
-        "agent_connected": agent_connected,
-        "backend_running": True
-    })
-@app.route("/api/start-protection", methods=["POST"])
-def start_protection():
-    global protection_active
-    protection_active = True
-    print("[SYSTEM] Protection started")
-    return jsonify({
-        "status": "success",
-        "protection_active": True,
-        "message": "Protection started"
-    }), 200
+# Add missing imports
+from collections import deque
+from datetime import datetime, timezone
+import os
+import json
+# In-memory log queue for async processing
+log_queue = deque(maxlen=1000)
 
-@app.route("/api/stop-protection", methods=["POST"])
-def stop_protection():
-    global protection_active
-    protection_active = False
-    print("[SYSTEM] Protection stopped")
-    return jsonify({
-        "status": "success",
-        "protection_active": False,
-        "message": "Protection stopped"
-    }), 200
+def log_queue_worker():
+    import time
+    while True:
+        if log_queue:
+            entry = log_queue.popleft()
+            try:
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("INSERT INTO logs (device_id, log_entry, timestamp) VALUES (?, ?, ?)", (entry['device_id'], entry['log_entry'], entry['timestamp']))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                logging.error(f"[ERROR] log_queue_worker: {e}")
+        else:
+            time.sleep(0.1)
+
+import threading
+threading.Thread(target=log_queue_worker, daemon=True).start()
+# Ensure all global variables are initialized
+monitoring_enabled = False
+agent_connected = False
+trust_score = 100.0
+system_status = "Protected"
+last_risk_event = None
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from collections import deque
+import sqlite3
+import json
+import os
+
+app = Flask(__name__, static_folder='static', static_url_path='')
+CORS(app, resources={r"/api/*": {"origins": ["http://localhost:3000", "http://127.0.0.1:3000"]}}, supports_credentials=True)
+
+# ================== MONITORING MODE ENDPOINTS ==================
 @app.route("/api/start-protection", methods=["POST"])
 def start_protection():
-    """Enable protection — analysis will process events."""
-    global protection_active, system_status
-    protection_active = True
-    system_status = "Protected"
-    print("[System] Protection started")
-    return jsonify({"status": "success", "protection_active": True}), 200
-from flask import Flask, request, jsonify
+    global monitoring_enabled
+    monitoring_enabled = True
+    print("[SYSTEM] Monitoring enabled")
+    return jsonify({"status": "success", "monitoring": True, "message": "Monitoring started"})
+
+import uuid
+import re
+import threading
+import time
+import subprocess
+from datetime import datetime, timezone
+
+
+# Health endpoint for server availability
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "ok",
+        "service": "SentinelAI Backend"
+    }), 200
 from flask_cors import CORS
 from collections import deque
 import sqlite3
@@ -67,8 +94,6 @@ except Exception as e:
     RULES = None
     DETECTION_ENGINE = 'DISABLED'
 
-app = Flask(__name__, static_folder='static', static_url_path='')
-CORS(app) # Enable CORS for frontend
 
 @app.route('/')
 def index():
@@ -76,12 +101,14 @@ def index():
 
 DB = "sentinel.db"
 
-# ================== GLOBAL SYSTEM STATE ==================
+
 trust_score = 100.0
 system_status = "Protected"
 last_risk_event = None
 is_isolated = False  # Flag to prevent repeated isolation attempts
-protection_active = False  # Whether protection monitoring is active
+protection_active = False  # Legacy, kept for compatibility
+monitoring_enabled = False  # NEW: Global monitoring mode
+agent_connected = False  # Tracks agent status
 
 # Tracks when each event type penalty was last applied (to prevent burst penalties)
 recent_events = {}
@@ -133,6 +160,9 @@ devices = {}
 
 def record_security_alert(event_type: str, process_name: str, severity: str, trust_score_val: float, trust_score_before: float = None):
     """Append a structured alert object to the security_alerts buffer."""
+    global monitoring_enabled
+    if not monitoring_enabled:
+        return
     old_score = round(trust_score_before, 1) if trust_score_before is not None else round(trust_score_val, 1)
     new_score = round(trust_score_val, 1)
     impact = round(old_score - new_score, 1)
@@ -867,57 +897,33 @@ def get_device_detail(device_id):
 @app.route("/api/logs", methods=["POST"])
 def receive_logs():
     """
-    API endpoint to receive and store logs.
-    Appends payload to event_window and triggers analysis.
-    Also stores agent telemetry in the database.
+    API endpoint to receive logs. Immediately appends to log_queue and returns success.
+    Heavy processing (DB, YARA, etc.) is handled by log_queue_worker.
     """
-    global agent_connected
-    agent_connected = True
-    payload = request.get_json()
-    if not payload: 
-        return jsonify({"error": "No payload"}), 400
-
-    print("[Debug] Payload received:", payload)
-
-    device_info = payload.get("device", {})
-    events = payload.get("events", [])
-
-    # Store each event in the logs table
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    for event in events:
-        cursor.execute(
-            "INSERT INTO logs (device_id, event_type, process_name, cmdline, timestamp) VALUES (?, ?, ?, ?, ?)",
-            (
-                device_info.get("id", ""),
-                event.get("event_type", ""),
-                event.get("process_name", ""),
-                event.get("cmdline", ""),
-                event.get("timestamp", "")
-            )
-        )
-    conn.commit()
-    conn.close()
-
     try:
-        if events:
-            num_stored = store_payload(device_info, events)
-        else:
-            num_stored = 0
+        payload = request.get_json()
+        if not payload:
+            return jsonify({"error": "No payload"}), 400
 
-        # Always return trust_score and feedback (last risk event description)
-        global trust_score, last_risk_event
-        feedback_msg = last_risk_event["description"] if last_risk_event and "description" in last_risk_event else ""
-        response = {
-            "status": "success",
-            "message": f"Stored {num_stored} event(s)",
-            "buffer_size": len(event_window),
-            "trust_score": trust_score,
-            "feedback": feedback_msg
-        }
-        return jsonify(response), 201
-    except sqlite3.OperationalError as exc:
-        return jsonify({"error": f"database error: {exc}"}), 503
+        device_info = payload.get("device", {})
+        events = payload.get("events", [])
+        for event in events:
+            log_queue.append({
+                "device_id": device_info.get("id", ""),
+                "log_entry": json.dumps({
+                    "event_type": event.get("event_type", ""),
+                    "process_name": event.get("process_name", ""),
+                    "cmdline": event.get("cmdline", ""),
+                    "timestamp": event.get("timestamp", "")
+                }),
+                "timestamp": event.get("timestamp", "")
+            })
+
+        # Update agent status/timestamp
+        global agent_connected, last_heartbeat
+        agent_connected = True
+        last_heartbeat = datetime.now(timezone.utc).isoformat()
+        return jsonify({"status": "success"}), 201
     except Exception as e:
         print(f"[ERROR] receive_logs: {e}")
         return jsonify({"error": "Failed to store payload"}), 500
@@ -943,30 +949,89 @@ def get_status():
 
 @app.route("/api/system-status", methods=["GET"])
 def get_system_status():
-    """Get global system state (trust score, status, last risk event, isolation state)"""
-    # Ensure lastEvent timestamp is always ISO string
-    event = last_risk_event.copy() if last_risk_event else None
-    if event and "timestamp" in event:
-        ts = event["timestamp"]
-        try:
-            # If already ISO string
+    """Get global system state (trust score, status, last risk event, isolation state, monitoring)"""
+    import logging
+    try:
+        # Ensure all variables are initialized
+        global monitoring_enabled, agent_connected, trust_score, system_status, last_risk_event
+        if 'monitoring_enabled' not in globals(): monitoring_enabled = False
+        if 'agent_connected' not in globals(): agent_connected = False
+        if 'trust_score' not in globals(): trust_score = 100.0
+        if 'system_status' not in globals(): system_status = "Protected"
+        if 'last_risk_event' not in globals(): last_risk_event = None
+
+        event = last_risk_event.copy() if last_risk_event else None
+        if event and "timestamp" in event:
+            ts = event["timestamp"]
             if isinstance(ts, str) and "T" in ts:
                 event["timestamp"] = ts
             else:
-                # Try float timestamp
                 event["timestamp"] = datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
-        except Exception:
-            event["timestamp"] = datetime.now(timezone.utc).isoformat()
-    return jsonify({
-        "trustScore": round(trust_score, 1),
-        "systemStatus": system_status,
-        "lastEvent": event,
-        "isIsolated": system_status == "Isolated",
-        "protectionActive": protection_active
-    }), 200
 
-@app.route("/api/threat-history", methods=["GET"])
-def get_threat_history():
+        # Agent status calculation: ensure UTC is used
+        agent_status = False
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT last_seen FROM devices ORDER BY last_seen DESC LIMIT 1")
+            row = cur.fetchone()
+            if row:
+                last_seen = row[0]
+                last_seen_dt = datetime.fromisoformat(last_seen)
+                now_utc = datetime.now(timezone.utc)
+                # Agent is online if last_seen within 30 seconds
+                agent_status = (now_utc - last_seen_dt).total_seconds() < 30
+            conn.close()
+        except Exception as e:
+            agent_status = False
+
+        def sanitize(obj):
+            if isinstance(obj, dict):
+                return {k: sanitize(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [sanitize(v) for v in obj]
+            elif callable(obj):
+                return str(obj)
+            elif isinstance(obj, (str, int, float, bool)) or obj is None:
+                return obj
+            else:
+                return str(obj)
+        event = sanitize(event)
+        if not event:
+            event = {
+                "event_type": "None",
+                "description": "No events yet",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "severity": "none",
+                "process_name": "None"
+            }
+        backend_status = True
+        response_dict = {
+            "monitoring": monitoring_enabled() if callable(monitoring_enabled) else monitoring_enabled,
+            "backend": backend_status() if callable(backend_status) else backend_status,
+            "agent": agent_status,
+            "trust_score": round(trust_score(), 1) if callable(trust_score) else round(trust_score, 1),
+            "system_status": system_status() if callable(system_status) else system_status,
+            "lastEvent": event,
+            "isIsolated": system_status() == "Isolated" if callable(system_status) else system_status == "Isolated"
+        }
+        def sanitize(obj):
+            if isinstance(obj, dict):
+                return {k: sanitize(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [sanitize(v) for v in obj]
+            elif callable(obj):
+                return str(obj)
+            elif isinstance(obj, (str, int, float, bool)) or obj is None:
+                return obj
+            else:
+                return str(obj)
+        response_dict = sanitize(response_dict)
+        return jsonify(response_dict), 200
+    except Exception as e:
+        logging.error(f"[ERROR] get_system_status: {e}")
+        return jsonify({"error": "Failed to get system status", "details": str(e)}), 500
+
     """Get timeline of threats ordered by timestamp DESC"""
     try:
         threats = get_all_threats()
@@ -1018,10 +1083,11 @@ def reset_monitoring():
 @app.route("/api/stop-protection", methods=["POST"])
 def stop_protection():
     """Disable protection — analysis will skip events."""
-    global protection_active
+    global protection_active, monitoring_enabled
     protection_active = False
+    monitoring_enabled = False
     print("[System] Protection stopped")
-    return jsonify({"status": "success", "protection_active": False}), 200
+    return jsonify({"status": "success", "protection_active": False, "monitoring": False, "message": "Protection stopped"}), 200
 
 @app.route("/api/system/restore", methods=["POST"])
 def restore_system_endpoint():
@@ -1225,8 +1291,9 @@ def run_analysis():
     """
     global trust_score, system_status, last_risk_event
 
-    # Skip analysis if protection is not active
-    if not protection_active:
+    # Skip analysis if monitoring is not enabled
+    global monitoring_enabled
+    if not monitoring_enabled:
         return
 
     # Analyze last 200 events
@@ -1882,4 +1949,114 @@ if __name__ == "__main__":
     cleanup_thread.start()
     print("[System] Background cleanup loop started (every 15 minutes)")
     
+def initialize_database():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT,
+            event_type TEXT,
+            process_name TEXT,
+            cmdline TEXT,
+            timestamp TEXT
+        )
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            process_name TEXT,
+            severity TEXT,
+            event_type TEXT,
+            timestamp TEXT
+        )
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS trust_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trust_score INTEGER,
+            timestamp TEXT
+        )
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS threat_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT,
+            severity TEXT,
+            timestamp TEXT
+        )
+        """)
+        conn.commit()
+        conn.close()
+        print("[Database] Initialization successful.")
+    except Exception as e:
+        print(f"[Database] Initialization failed: {e}")
+        # Log error but allow backend to start
+
+# Ensure database is initialized before server starts
+initialize_database()
+
+# API Endpoints
+from flask import jsonify, request
+
+
+@app.route("/api/system-status", methods=["GET"])
+def system_status():
+    global protection_active, agent_connected
+    return jsonify({
+        "protection_active": protection_active,
+        "agent_connected": agent_connected if 'agent_connected' in globals() else False,
+        "backend_running": True
+    })
+
+@app.route("/api/alerts", methods=["GET"])
+def get_alerts():
+    # Return last 100 alerts
+    return jsonify(list(security_alerts))
+
+
+@app.route("/api/threat-history", methods=["GET"])
+def get_threat_history():
+    return jsonify(get_all_threats())
+
+    protection_active = True
+    print("[SYSTEM] Protection started")
+    return jsonify({"status": "success", "protection_active": True, "message": "Protection started"})
+
+
+import logging
+@app.route("/api/logs", methods=["POST"])
+def logs():
+    try:
+        data = request.get_json(force=True)
+        device_id = data.get("device_id")
+        log_entry = data.get("log_entry")
+        timestamp = data.get("timestamp", datetime.now(timezone.utc).isoformat())
+        log_queue.append({"device_id": device_id, "log_entry": log_entry, "timestamp": timestamp})
+
+        # Update agent last_seen in DB and global
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO devices (id, last_seen)
+                VALUES (?, ?)
+                ON CONFLICT(id) DO UPDATE SET last_seen = excluded.last_seen
+            """, (device_id, timestamp))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logging.error(f"[ERROR] updating agent last_seen: {e}")
+
+        global agent_connected, last_seen
+        agent_connected = True
+        last_seen = timestamp
+
+        return jsonify({"status": "success", "message": "Log entry queued."}), 201
+    except Exception as e:
+        logging.error(f"[ERROR] logs: {e}")
+        return jsonify({"error": "Failed to queue log entry", "details": str(e)}), 503
+if __name__ == '__main__':
+    print("[System] Background cleanup loop started (every 15 minutes)")
     app.run(host="0.0.0.0", port=5000, debug=True)

@@ -134,17 +134,70 @@ ipcMain.handle('stop-system', async () => {
 
 // Start app when ready
 app.whenReady().then(() => {
-  // Start frontend first
-  startFrontend();
-  
-  // Wait for frontend to be ready, then start backend/agent and create window
-  setTimeout(() => {
-    startServices();
+  // Controlled startup order
+  // 1. Start backend
+  if (!backendProcess) {
+    backendProcess = spawn("python", [path.join(__dirname, "../backend/app.py")], {
+      cwd: __dirname,
+      shell: true
+    });
+    backendProcess.stdout.on("data", (data) => {
+      console.log("Backend:", data.toString());
+    });
+    backendProcess.stderr.on("data", (data) => {
+      console.error("Backend Error:", data.toString());
+    });
+    backendProcess.on("close", (code) => {
+      console.log("Backend exited with code:", code);
+      backendProcess = null;
+    });
+  }
+
+  // 2. Poll backend health until ready
+  const waitForBackend = async () => {
+    const http = require('http');
+    return new Promise((resolve) => {
+      const check = () => {
+        http.get({ hostname: 'localhost', port: 5000, path: '/health', timeout: 1000 }, (res) => {
+          if (res.statusCode === 200) {
+            resolve(true);
+          } else {
+            setTimeout(check, 1000);
+          }
+        }).on('error', () => {
+          setTimeout(check, 1000);
+        });
+      };
+      check();
+    });
+  };
+
+  waitForBackend().then(() => {
+    // 3. Start agent
+    if (!agentProcess) {
+      agentProcess = spawn("python", [path.join(__dirname, "../Agent/run_agent.py")], {
+        cwd: __dirname,
+        shell: true
+      });
+      agentProcess.stdout.on("data", (data) => {
+        console.log("Agent:", data.toString());
+      });
+      agentProcess.stderr.on("data", (data) => {
+        console.error("Agent Error:", data.toString());
+      });
+      agentProcess.on("close", (code) => {
+        console.log("Agent exited with code:", code);
+        agentProcess = null;
+      });
+    }
+
+    // 4. Start frontend
+    startFrontend();
+    // 5. Launch dashboard window
     createWindow();
-  }, 3000); // 3 second delay for frontend to start
-  
+  });
+
   app.on('activate', () => {
-    // On macOS, re-create window when dock icon is clicked
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow();
     }
